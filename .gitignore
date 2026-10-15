@@ -1,0 +1,36 @@
+# Dependencies and generated builds
+node_modules/
+dist/
+coverage/
+.vite/
+.cache/
+.npm-cache/
+*.tsbuildinfo
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+firebase-service-account*.json
+*-firebase-adminsdk-*.json
+*.jks
+*.keystore
+
+# Firebase and browser testing output
+.firebase/
+.playwright-mcp/
+test-results/
+playwright-report/
+/artifacts/
+
+# Logs, operating system and editor temporary files
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Python helper caches
+__pycache__/
+*.py[cod]
