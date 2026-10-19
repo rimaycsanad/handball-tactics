@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 export async function exportJson(name: string, value: unknown) {
   const text =
     typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -7,7 +8,7 @@ export async function exportJson(name: string, value: unknown) {
     matchMedia("(pointer: coarse)").matches &&
     navigator.canShare?.({ files: [file] })
   ) {
-    await navigator.share({ files: [file], title: "Taktikák exportálása" });
+    await navigator.share({ files: [file], title: t("Taktikák exportálása") });
     return;
   }
   const url = URL.createObjectURL(file);

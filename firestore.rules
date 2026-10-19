@@ -1,0 +1,126 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function verified() { return request.auth != null && request.auth.token.email_verified == true; }
+    function member() {
+      return verified() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.admitted == true
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email == request.auth.token.email.lower();
+    }
+    function hasRole(roles) { return member() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in roles; }
+    function writer() { return hasRole(['editor', 'admin']); }
+    function admin() { return hasRole(['admin']); }
+    function invitedProfile(data, uid) {
+      let email = request.auth.token.email.lower();
+      let invite = get(/databases/$(database)/documents/invitations/$(email)).data;
+      return verified() && request.auth.uid == uid && data.email == email
+        && data.role == invite.role && data.admitted == true && data.status == 'active'
+        && !existsAfter(/databases/$(database)/documents/invitations/$(email))
+        && (!('registrationKey' in invite) || !existsAfter(/databases/$(database)/documents/registrationPermits/$(invite.registrationKey)));
+    }
+    function validProfile(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'status', 'admitted', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'status', 'admitted', 'createdAt', 'updatedAt'])
+        && data.uid == uid && data.email is string && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() <= 120
+        && data.role in ['user', 'editor', 'admin'] && data.status in ['active', 'suspended']
+        && data.admitted is bool && data.createdAt is timestamp && data.updatedAt == request.time;
+    }
+    match /users/{uid} {
+      allow get: if request.auth != null && (request.auth.uid == uid || admin());
+      allow list: if admin() && request.query.limit <= 50;
+      allow create: if verified() && request.auth.uid == uid && validProfile(request.resource.data, uid)
+        && invitedProfile(request.resource.data, uid) && request.resource.data.createdAt == request.time;
+      allow update: if request.auth != null && validProfile(request.resource.data, uid)
+        && ((admin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'status', 'admitted', 'updatedAt'])
+          && (request.auth.uid != uid || (request.resource.data.role == 'admin' && request.resource.data.status == 'active' && request.resource.data.admitted == true)))
+        || (resource.data.role == 'user' && resource.data.status == 'active'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'admitted', 'updatedAt'])
+          && invitedProfile(request.resource.data, uid)));
+      allow delete: if false;
+    }
+    match /invitations/{email} {
+      allow get: if admin() || (verified() && request.auth.token.email.lower() == email);
+      allow list: if admin() && request.query.limit <= 50;
+      allow create: if admin() && email == email.lower() && email.size() <= 254
+        && email.matches('^[^@/ ]+@[^@/ ]+[.][^@/ ]+$')
+        && request.resource.data.keys().hasAll(['role', 'registrationKey', 'createdAt', 'createdBy'])
+        && request.resource.data.keys().hasOnly(['role', 'registrationKey', 'createdAt', 'createdBy'])
+        && request.resource.data.role in ['user', 'editor', 'admin']
+        && request.resource.data.registrationKey is string && request.resource.data.registrationKey.matches('^[a-f0-9]{64}$')
+        && getAfter(/databases/$(database)/documents/registrationPermits/$(request.resource.data.registrationKey)).data.active == true
+        && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if (admin() && (!('registrationKey' in resource.data) || !existsAfter(/databases/$(database)/documents/registrationPermits/$(resource.data.registrationKey))))
+        || (verified() && request.auth.token.email.lower() == email
+          && invitedProfile(getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data, request.auth.uid));
+    }
+    // An exact email hash reveals only whether registration is enabled. Emails,
+    // initial roles and inviter identities remain in the protected invitations collection.
+    match /registrationPermits/{key} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if admin() && key.matches('^[a-f0-9]{64}$')
+        && request.resource.data.keys().hasOnly(['active']) && request.resource.data.active == true;
+      allow update: if false;
+      allow delete: if admin() || (verified()
+        && get(/databases/$(database)/documents/invitations/$(request.auth.token.email.lower())).data.registrationKey == key
+        && invitedProfile(getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data, request.auth.uid));
+    }
+    match /catalogReleases/{releaseId} {
+      allow get: if true;
+      allow create: if writer()
+        && request.resource.data.keys().hasOnly(['schemaVersion', 'contentVersion', 'playCount', 'publicPlayIds', 'createdBy', 'createdAt'])
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.contentVersion is int && request.resource.data.contentVersion > 0
+        && request.resource.data.playCount is int && request.resource.data.playCount > 0 && request.resource.data.playCount <= 500
+        && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+      match /plays/{playId} {
+        allow read: if member() ||
+          (get(/databases/$(database)/documents/catalog/current).data.releaseId == releaseId
+           && playId in get(/databases/$(database)/documents/catalog/current).data.publicPlayIds);
+        allow create: if writer() && !exists(/databases/$(database)/documents/catalogReleases/$(releaseId))
+          && request.resource.data.keys().hasOnly(['order', 'play'])
+          && request.resource.data.order is int && request.resource.data.order >= 0 && request.resource.data.order < 500
+          && request.resource.data.play.id == playId && request.resource.data.play.schemaVersion == 1
+          && request.resource.data.play.requiresAuth is bool
+          && request.resource.data.play.title is string && request.resource.data.play.title.size() > 0
+          && request.resource.data.play.phases is list && request.resource.data.play.phases.size() > 0
+          && request.resource.data.play.phases.size() <= 100;
+        allow update, delete: if false;
+      }
+    }
+    function publicPlay(releaseId, playId) {
+      return getAfter(/databases/$(database)/documents/catalogReleases/$(releaseId)/plays/$(playId)).data.play.requiresAuth == false;
+    }
+    function validManifest() {
+      let data = request.resource.data;
+      let release = getAfter(/databases/$(database)/documents/catalogReleases/$(data.releaseId)).data;
+      return data.keys().hasOnly(['schemaVersion', 'contentVersion', 'releaseId', 'playCount', 'publicPlayIds', 'updatedAt'])
+        && data.schemaVersion == 1 && data.contentVersion is int && data.contentVersion > 0
+        && data.releaseId is string && data.releaseId.matches('^[a-zA-Z0-9-]{1,100}$')
+        && data.playCount is int && data.playCount > 0 && data.playCount <= 500
+        && data.publicPlayIds is list && data.publicPlayIds.size() >= 1 && data.publicPlayIds.size() <= 5
+        && data.publicPlayIds.toSet().size() == data.publicPlayIds.size()
+        && release.publicPlayIds == data.publicPlayIds
+        && publicPlay(data.releaseId, data.publicPlayIds[0])
+        && (data.publicPlayIds.size() < 2 || publicPlay(data.releaseId, data.publicPlayIds[1]))
+        && (data.publicPlayIds.size() < 3 || publicPlay(data.releaseId, data.publicPlayIds[2]))
+        && (data.publicPlayIds.size() < 4 || publicPlay(data.releaseId, data.publicPlayIds[3]))
+        && (data.publicPlayIds.size() < 5 || publicPlay(data.releaseId, data.publicPlayIds[4]))
+        && data.updatedAt == request.time && release.contentVersion == data.contentVersion
+        && release.playCount == data.playCount && release.createdBy == request.auth.uid;
+    }
+    match /catalog/current {
+      allow get: if true;
+      allow create: if writer() && validManifest();
+      allow update: if writer() && validManifest()
+        && request.resource.data.contentVersion == resource.data.contentVersion + 1
+        && request.resource.data.releaseId != resource.data.releaseId;
+      allow delete: if false;
+    }
+  }
+}

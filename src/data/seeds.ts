@@ -1,9 +1,10 @@
+import { englishFor } from "./catalog-translation";
 import { uid, type Phase, type Play } from "../domain/model";
-import { defaultActors, defenseActors } from "./actors";
+import { defenseActors } from "./actors";
 import { expandedPlays } from "./expanded-tactics";
 import { teachingSources } from "./catalog-sources";
 export { defaultActors } from "./actors";
-export const builtInCatalogVersion = 2;
+export const builtInCatalogVersion = 5;
 
 const action = (
   kind: Play["phases"][number]["actions"][number]["kind"],
@@ -92,6 +93,36 @@ const wing = (): Phase[] => [
     2.5,
   ),
 ];
+const behindDisruptor = (): Phase[] => {
+  const phases = wing();
+  phases[0].note =
+    "A bal szélső a zavaró mögé fut. Az 1-es védő elkíséri, majd átadja a 2-esnek. A zavaró (3-as) a jobb oldali labdás felé tolódik, az 5-ös kilép a jobbátlövőre; a 4-es a beállót biztosítja.";
+  phases[0].actions.push(
+    action("run", "D1", 4.8, 5.7, 0.2, 1.2),
+    action("run", "D1", 5.4, 5.8, 1.4, 0.6),
+    action("run", "D2", 8.7, 7.3, 0.4, 1.4),
+    action("run", "D3", 11.7, 10.3, 0.25, 1.2),
+    action("run", "D3", 11.6, 9.6, 1.5, 0.8),
+    action("run", "D4", 11.2, 7.1, 0.5, 1),
+    action("run", "D5", 13.6, 7.5, 0.35, 0.6),
+    action("run", "D5", 12.6, 7.7, 0.95, 1.05),
+    action("run", "D6", 15.9, 5.9, 0.4, 1.2),
+  );
+  phases[1].note =
+    "A passz a zavaró mögé érkezik. A 2-es késve zár a befutóra, az 1-es visszasegít, a zavaró visszalép a belső passzsávba. A jobb oldali védők visszarendeződnek, miközben a befutó befejezi az akciót.";
+  phases[1].actions.push(
+    action("run", "D1", 5.7, 6.1, 0.1, 0.8),
+    action("run", "D1", 5.8, 6.6, 1, 0.4),
+    action("run", "D2", 8.4, 7.1, 0.25, 0.6),
+    action("run", "D2", 8.1, 6.3, 0.95, 0.45),
+    action("run", "D3", 10.7, 8.9, 0.2, 0.8),
+    action("run", "D3", 9.8, 8.5, 1, 0.7),
+    action("run", "D4", 10.9, 7.6, 0.4, 0.9),
+    action("run", "D5", 12.6, 7.1, 0.3, 0.9),
+    action("run", "D6", 15.4, 5.8, 0.3, 0.9),
+  );
+  return phases;
+};
 const pivot = (): Phase[] => [
   phase(
     "start",
@@ -135,22 +166,42 @@ const doubleCross = (): Phase[] => [
   phase(
     "start",
     "Első kereszt",
-    "A balátlövő közép felé támad, az irányító a megnyíló bal oldali területre fut.",
+    "A balátlövő közép felé támad, az irányító a megnyíló bal oldali területre fut. A 2-es védő kilép a labdásra, majd a 3-asnak átadva visszazár az irányító elé. A többiek a labda felé tolódnak, a 4-es biztosítja a beállót.",
     [
       action("pass", "CB", 5.5, 11, 0, 0.5, "LB"),
       action("dribble", "LB", 10, 10, 0.6, 1.2),
       action("run", "CB", 6, 10, 0.6, 1.4),
+      // Step out on the ball, hand the crossing attacker over, then recover.
+      action("run", "D2", 6.2, 8.3, 0.2, 0.5),
+      action("run", "D2", 8, 8.2, 0.7, 0.9),
+      action("run", "D2", 6.3, 7.7, 1.6, 0.8),
+      action("run", "D3", 8.2, 7.5, 0.3, 0.5),
+      action("run", "D3", 9.7, 8.4, 0.9, 1),
+      action("run", "D4", 11.2, 7.1, 0.5, 0.9),
+      action("run", "D5", 13.1, 6.8, 0.5, 1.1),
+      action("run", "D1", 3.8, 5.4, 0.3, 1.2),
+      action("run", "D6", 16.1, 5.3, 0.6, 1.1),
     ],
     [{ label: "Folytatás jobb oldalra", phaseId: "second" }],
   ),
   phase(
     "second",
     "Második kereszt",
-    "A jobbátlövő átveszi a labdát, majd a keresztezésből támad.",
+    "A jobbátlövő átveszi a labdát, majd a keresztezésből támad. Az 5-ös befelé kíséri, majd átadja a 4-esnek és visszazár. A 3-as visszalép a beállóhoz, a 4-es a labda átvételekor kilép a lövésre; a szélső védők szűkítenek.",
     [
       action("run", "RB", 11, 9, 0, 1.4),
       action("pass", "LB", 11, 9, 1.4, 0.5, "RB"),
       action("shot", "RB", 10, 0, 2.4, 0.6),
+      // The right side takes over the second cross; the centre covers behind.
+      action("run", "D5", 12.5, 8, 0.1, 0.9),
+      action("run", "D5", 13, 7.1, 1.1, 0.9),
+      action("run", "D4", 11.5, 7.8, 0.7, 0.7),
+      action("run", "D4", 11.1, 7.8, 1.9, 0.5),
+      action("run", "D3", 8.9, 7.3, 0.2, 1.1),
+      action("run", "D3", 9, 7.5, 1.9, 0.5),
+      action("run", "D2", 7, 7, 0.2, 1),
+      action("run", "D1", 4.1, 5.5, 0.3, 1),
+      action("run", "D6", 15.5, 5.8, 0.3, 1.2),
     ],
     [],
     3.5,
@@ -193,7 +244,14 @@ const configs = [
     pivot,
   ],
   ["Kettős kereszt", "Keresztek", "6:0", "U18", "Haladó", doubleCross],
-  ["Befutás a zavaró mögé", "Befutások", "5:1", "U16", "Középhaladó", wing],
+  [
+    "Befutás a zavaró mögé",
+    "Befutások",
+    "5:1",
+    "U16",
+    "Középhaladó",
+    behindDisruptor,
+  ],
   [
     "Kereszt nyitott védelem ellen",
     "Keresztek",
@@ -244,6 +302,8 @@ const legacyPlays: Play[] = configs.map(
     const actors = defenseActors(defense);
     if (defense === "5:1")
       actors.find((a) => a.id === "D3")!.position = { x: 10, y: 10 };
+    if (factory === behindDisruptor)
+      actors.find((a) => a.id === "D4")!.position = { x: 11.4, y: 6.8 };
     if (defense === "3:2:1") {
       actors.find((a) => a.id === "D3")!.position = { x: 10, y: 11 };
       actors.find((a) => a.id === "D2")!.position = { x: 6, y: 9 };
@@ -268,6 +328,8 @@ const legacyPlays: Play[] = configs.map(
       actors.find((a) => a.id === "RW")!.position = { x: 18, y: 25 };
     }
     const phases = factory();
+    const hasAnimatedDefense =
+      factory === doubleCross || factory === behindDisruptor;
     if (i === 6) {
       phases[0].title = "Átlövő befutása második beállóba";
       phases[0].note =
@@ -303,8 +365,9 @@ const legacyPlays: Play[] = configs.map(
         a.id = `sample-${i + 1}-action-${pi}-${ai}`;
     return {
       schemaVersion: 1,
+      requiresAuth: true,
       id: `sample-${i + 1}`,
-      revision: 2,
+      revision: hasAnimatedDefense ? 3 : 2,
       title,
       category,
       defense,
@@ -340,32 +403,18 @@ const legacyPlays: Play[] = configs.map(
               ? [teachingSources.analysis, teachingSources.superiority]
               : [teachingSources.giveGo]),
       ],
-      updatedAt: "2026-10-14T00:00:00.000Z",
+      updatedAt: hasAnimatedDefense
+        ? "2026-10-15T00:00:00.000Z"
+        : "2026-10-14T00:00:00.000Z",
     };
   },
 );
-export const builtInPlays: Play[] = [...legacyPlays, ...expandedPlays];
+export const builtInPlays: Play[] = [...legacyPlays, ...expandedPlays].map(
+  (play, index) => ({
+    ...play,
+    requiresAuth: index >= 5,
+    english: englishFor(play),
+  }),
+);
 
-export function newPlay(): Play {
-  return {
-    schemaVersion: 1,
-    id: uid(),
-    revision: 1,
-    title: "Új taktika",
-    description: "",
-    category: "Saját taktika",
-    defense: "6:0",
-    ageGroup: "U16",
-    difficulty: "Kezdő",
-    formation: "3:3",
-    court: "half",
-    tags: [],
-    actors: structuredClone(defaultActors),
-    ballOwnerId: "CB",
-    entryPhaseId: "start",
-    phases: [phase("start", "1. fázis", "", [], [], 3)],
-    coachingPoints: [],
-    sources: [],
-    updatedAt: new Date().toISOString(),
-  };
-}
+export { newPlay } from "./new-play";

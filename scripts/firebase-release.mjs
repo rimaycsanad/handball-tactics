@@ -9,8 +9,10 @@ const aliases = existsSync(".firebaserc")
   : {};
 const project =
   process.env.FIREBASE_PROJECT_ID?.trim() || aliases.projects?.default;
-if (!["web", "preview"].includes(mode))
-  throw new Error("Használat: node scripts/firebase-release.mjs web|preview");
+if (!["web", "preview", "backend"].includes(mode))
+  throw new Error(
+    "Használat: node scripts/firebase-release.mjs web|preview|backend",
+  );
 if (!project)
   throw new Error(
     "Állítsd be az alapértelmezett projektet a .firebaserc fájlban, vagy a FIREBASE_PROJECT_ID környezeti változót.",
@@ -27,13 +29,17 @@ function run(command, args) {
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
-run("npm", ["run", "build"]);
-if (mode === "web")
+if (mode !== "backend") run("npm", ["run", "build"]);
+if (mode === "backend")
+  run(cli, ["deploy", "--only", "auth,firestore", "--project", project]);
+else if (mode === "web")
   run(cli, ["deploy", "--only", "hosting", "--project", project]);
 else
   run(cli, [
     "hosting:channel:deploy",
     process.env.FIREBASE_PREVIEW_CHANNEL || "testers",
+    "--only",
+    "handball-playlab",
     "--expires",
     "7d",
     "--project",

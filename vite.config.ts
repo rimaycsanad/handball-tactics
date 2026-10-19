@@ -11,8 +11,8 @@ export default defineConfig({
       includeAssets: ["icons/*.png", "favicon.svg"],
       manifest: {
         id: "/",
-        name: "Handball Tactics",
-        short_name: "Tactics",
+        name: "Handball PlayLab",
+        short_name: "PlayLab",
         lang: "hu",
         description: "Kézilabda taktikatár és szerkesztő",
         start_url: "/",

@@ -6,6 +6,7 @@ coverage/
 .cache/
 .npm-cache/
 *.tsbuildinfo
+.idea/
 
 # Local environment and credentials
 .env
@@ -34,3 +35,6 @@ Thumbs.db
 # Python helper caches
 __pycache__/
 *.py[cod]
+
+# Database
+public/catalog/catalog.json

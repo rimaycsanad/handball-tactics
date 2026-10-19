@@ -8,21 +8,32 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node scripts/verify-public-build.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "test": "vitest run",
     "format": "prettier --write src scripts package.json tsconfig.json firebase.json index.html vite.config.ts README.md",
     "catalog:export": "node scripts/export-catalog.mjs",
     "firebase:web": "node scripts/firebase-release.mjs web",
-    "firebase:preview": "node scripts/firebase-release.mjs preview"
+    "firebase:backend": "node scripts/firebase-release.mjs backend",
+    "firebase:preview": "node scripts/firebase-release.mjs preview",
+    "firebase:data": "node scripts/firebase-data.mjs",
+    "firebase:emulators": "firebase emulators:start --only auth,firestore --project demo-handball-tactics",
+    "test:firebase": "firebase emulators:exec --only auth,firestore --project demo-handball-tactics \"node --test scripts/verify-firebase.mjs\""
   },
   "dependencies": {
+    "firebase": "^13.0.0",
     "lucide-react": "^1.57.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "zod": "^4.6.7"
   },
+  "overrides": {
+    "@firebase/firestore": {
+      "@grpc/grpc-js": "^1.13.6"
+    }
+  },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

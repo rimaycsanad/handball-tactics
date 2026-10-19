@@ -50,6 +50,8 @@ export const playSchema = z
     schemaVersion: z.literal(1),
     id: z.string().min(1).max(100),
     revision: z.number().int().positive(),
+    requiresAuth: z.boolean().default(true),
+    english: z.record(z.string().max(80), z.string().max(3000)).optional(),
     title: z.string().min(1).max(120),
     description: z.string().max(3000),
     category: z.string().min(1).max(80),

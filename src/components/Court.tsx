@@ -1,3 +1,4 @@
+import { t, playText } from "../i18n";
 import { useRef, useState } from "react";
 import type { Play, Point, Action } from "../domain/model";
 import type { Scene } from "../domain/engine";
@@ -54,7 +55,7 @@ export function Court({
       className={`court ${mini ? "court-mini" : ""} ${editing ? "is-editing" : ""}`}
       viewBox={`-.6 -1 21.2 ${height + 2}`}
       role={editing ? "group" : "img"}
-      aria-label={`${play.court === "full" ? "Egész" : "Fél"} kézilabdapálya · ${play.title}`}
+      aria-label={t`${play.court === "full" ? t("Egész") : t("Fél")} kézilabdapálya · ${playText(play, play.title)}`}
       onPointerMove={(e) => {
         if (drag) setDrag({ ...drag, point: point(e.clientX, e.clientY) });
       }}
@@ -204,7 +205,7 @@ export function Court({
               className={editing ? "actor interactive" : "actor"}
               role={editing ? "button" : undefined}
               aria-label={
-                editing ? `${actor.label} játékos kiválasztása` : undefined
+                editing ? t`${t(actor.label)} játékos kiválasztása` : undefined
               }
               tabIndex={editing ? 0 : undefined}
               onKeyDown={(e) => {
@@ -283,7 +284,7 @@ export function Court({
                 fill={actor.team === "attack" ? "#fff" : "#3a4b33"}
                 pointerEvents="none"
               >
-                {actor.label}
+                {t(actor.label)}
               </text>
             </g>
           );
@@ -303,7 +304,7 @@ export function Court({
           fontFamily="system-ui,sans-serif"
         >
           <text x=".5" y="19.5">
-            HANDBALL TACTICS
+            {t("HANDBALL PLAYLAB")}
           </text>
           <text x="19.5" y="19.5" textAnchor="end">
             {height === 40 ? "40 × 20 M" : "20 × 20 M"}

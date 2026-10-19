@@ -149,6 +149,7 @@ export function makeTactic(spec: TacticSpec): Play {
   );
   return {
     schemaVersion: 1,
+    requiresAuth: true,
     id: spec.id,
     revision: 1,
     title: spec.title,

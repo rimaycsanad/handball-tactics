@@ -30,11 +30,21 @@ await mkdir("public/catalog", { recursive: true });
 await writeFile(
   "public/catalog/catalog.json",
   JSON.stringify(
-    { schemaVersion: 1, contentVersion, plays: builtInPlays },
+    {
+      schemaVersion: 1,
+      contentVersion,
+      plays: builtInPlays.filter((p) => !p.requiresAuth),
+    },
     null,
     2,
   ) + "\n",
 );
 console.log(
   `Katalógus exportálva: ${builtInPlays.length} taktika, ${contentVersion}. tartalomverzió.`,
+);
+
+await mkdir(".firebase", { recursive: true });
+await writeFile(
+  ".firebase/seed-catalog.json",
+  JSON.stringify({ schemaVersion: 1, contentVersion, plays: builtInPlays }),
 );

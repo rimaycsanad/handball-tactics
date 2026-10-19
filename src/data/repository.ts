@@ -7,7 +7,11 @@ export const catalogSchema = z
   .object({
     schemaVersion: z.literal(1),
     contentVersion: z.number().int().positive(),
-    plays: z.array(playSchema).min(1).max(500),
+    plays: z.array(playSchema).max(500),
+    audience: z.string().optional(),
+    cloud: z
+      .object({ projectId: z.string(), releaseId: z.string() })
+      .optional(),
   })
   .superRefine((c, ctx) => {
     if (new Set(c.plays.map((p) => p.id)).size !== c.plays.length)
@@ -110,26 +114,68 @@ export class Repository {
       await this.store.write("library.json", JSON.stringify(valid));
     });
   }
-  async loadCatalog(): Promise<Catalog | null> {
-    const raw = await this.store.read("catalog.json");
-    return raw === null ? null : catalogSchema.parse(JSON.parse(raw));
+  async loadCatalog(audience = "public"): Promise<Catalog | null> {
+    const raw = await this.store.read(this.catalogKey(audience));
+    if (!raw || raw === "null") return null;
+    const catalog = catalogSchema.parse(JSON.parse(raw));
+    return catalog.audience === audience ? catalog : null;
+  }
+  private catalogKey(audience: string) {
+    return `catalog-${encodeURIComponent(audience)}.json`;
+  }
+  clearCatalog(audience: string) {
+    return this.enqueue(() =>
+      this.store.write(this.catalogKey(audience), "null"),
+    );
+  }
+  discardLegacyCatalog() {
+    return this.enqueue(() => this.store.write("catalog.json", "null"));
   }
   updateCatalog(source: CatalogSource, minimumVersion: number) {
     return this.enqueue(async () => {
       const catalog = catalogSchema.parse(await source.fetch());
       if (catalog.contentVersion < minimumVersion)
         throw new Error("A katalógus régebbi a jelenlegi változatnál.");
-      await this.store.write("catalog.json", JSON.stringify(catalog));
+      const audience = catalog.audience ?? "public";
+      const previous = await this.loadCatalog(audience);
+      if (previous && previous.contentVersion > catalog.contentVersion)
+        throw new Error("A katalógus régebbi a jelenlegi változatnál.");
+      await this.store.write(
+        this.catalogKey(audience),
+        JSON.stringify(catalog),
+      );
+      // Refresh the safe guest copy too, so signing out never restores an older
+      // public selection after an editor changes a tactic's visibility.
+      if (audience !== "public") {
+        const previousPublic = await this.loadCatalog("public");
+        if (
+          !previousPublic ||
+          previousPublic.contentVersion <= catalog.contentVersion
+        )
+          await this.store.write(
+            this.catalogKey("public"),
+            JSON.stringify({
+              ...catalog,
+              audience: "public",
+              plays: catalog.plays.filter((p) => !p.requiresAuth).slice(0, 5),
+            }),
+          );
+      }
       return catalog;
     });
   }
-  saveDraft(play: Play | null) {
+  saveDraft(play: Play | null, audience?: string) {
     return this.enqueue(() =>
-      this.store.write("draft.json", JSON.stringify(play)),
+      this.store.write(
+        audience ? `draft-${encodeURIComponent(audience)}.json` : "draft.json",
+        JSON.stringify(play),
+      ),
     );
   }
-  async loadDraft(): Promise<Play | null> {
-    const raw = await this.store.read("draft.json");
+  async loadDraft(audience?: string): Promise<Play | null> {
+    const raw = await this.store.read(
+      audience ? `draft-${encodeURIComponent(audience)}.json` : "draft.json",
+    );
     if (!raw || raw === "null") return null;
     // An unfinished draft may have empty metadata or incomplete transitions.
     const draft = draftSchema.parse(JSON.parse(raw));

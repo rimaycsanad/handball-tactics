@@ -1,3 +1,5 @@
+import { translationKey } from "./domain/translation-key";
+import { t, playText, useLanguage } from "./i18n";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useRegisterSW } from "virtual:pwa-register/react";
 import {
@@ -27,6 +29,8 @@ import {
   Shield,
   Trash2,
   Undo2,
+  UserRound,
+  UsersRound,
   Upload,
   Wifi,
   WifiOff,
@@ -46,8 +50,8 @@ import {
   type Point,
 } from "./domain/model";
 import { phaseBase, sceneAt, validateBallFlow } from "./domain/engine";
-import { builtInPlays, newPlay } from "./data/seeds";
-import { selectCatalog } from "./data/catalog-selection";
+import { newPlay } from "./data/new-play";
+import { emptySelection, selectCatalog } from "./data/catalog-selection";
 import { createFileStore } from "./data/storage";
 import {
   HttpCatalogSource,
@@ -57,9 +61,24 @@ import {
   type Library,
 } from "./data/repository";
 import { exportJson } from "./data/export";
+import { AccountPanel } from "./components/AccountPanel";
+import { UserManagement } from "./components/UserManagement";
+import { useAccount } from "./cloud/use-account";
+import { canRead, canWrite, cloudError } from "./cloud/access";
+import {
+  FirestoreCatalogSource,
+  publishCatalog,
+  replaceCatalogPlay,
+} from "./cloud/catalog";
 
-type View = "library" | "own" | "editor" | "settings";
-type Editor = { play: Play; undo: Play[]; redo: Play[]; saved: string };
+type View = "library" | "own" | "editor" | "settings" | "account" | "users";
+type Editor = {
+  play: Play;
+  undo: Play[];
+  redo: Play[];
+  saved: string;
+  shared?: boolean;
+};
 type InstallEvent = Event & {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: string }>;
@@ -93,18 +112,34 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 export function App() {
+  const [language, changeLanguage] = useLanguage();
+  function newLocalPlay() {
+    const play = newPlay();
+    if (language === "en") {
+      play.title = t(play.title);
+      play.category = t(play.category);
+      play.phases[0].title = t(play.phases[0].title);
+    }
+    return play;
+  }
+  const account = useAccount();
   const [repo, setRepo] = useState<Repository>();
   const [library, setLibrary] = useState<Library>();
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [draft, setDraft] = useState<Play | null>(null);
+  const [draftOwner, setDraftOwner] = useState<string>();
   const [fatal, setFatal] = useState("");
-  const [view, setView] = useState<View>("library");
-  const [selected, setSelected] = useState<Play>(builtInPlays[0]);
+  const [view, setView] = useState<View>(
+    new URLSearchParams(location.search).get("register") === "1"
+      ? "account"
+      : "library",
+  );
+  const [selectedDocument, setSelected] = useState<Play>(emptySelection);
   const [editor, setEditor] = useState<Editor | null>(null);
   const [tool, setTool] = useState<"place" | ActionKind>("place");
   const [selectedActor, setSelectedActor] = useState("CB");
   const [selectedAction, setSelectedAction] = useState("");
-  const [route, setRoute] = useState<string[]>([selected.entryPhaseId]);
+  const [route, setRoute] = useState<string[]>([selectedDocument.entryPhaseId]);
   const [index, setIndex] = useState(0);
   const [time, setTime] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -134,6 +169,8 @@ export function App() {
   const [offlineCached, setOfflineCached] = useState(false);
   const [catalogUrl, setCatalogUrl] = useState("");
   const [updating, setUpdating] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState("");
   const uploadRef = useRef<HTMLInputElement>(null);
   const boardRef = useRef<HTMLDivElement>(null);
   const dirty = !!editor && JSON.stringify(editor.play) !== editor.saved;
@@ -152,8 +189,28 @@ export function App() {
   });
   const offlineReady = serviceWorkerReady || offlineCached;
   const notice = (text: string, error = false) => setMessage({ text, error });
-  const activeCatalog = selectCatalog(catalog);
+  const teamMember =
+    canRead(account.profile, !!account.user?.emailVerified) &&
+    (account.confirmed || !online);
+  const audience = teamMember ? account.user!.uid : "public";
+  const audienceRef = useRef(audience);
+  audienceRef.current = audience;
+  const activeCatalog = selectCatalog(
+    catalog,
+    teamMember ? account.user?.uid : undefined,
+  );
   const allCatalog = activeCatalog.plays;
+  const selected =
+    view === "library"
+      ? (allCatalog.find((p) => p.id === selectedDocument.id) ??
+        allCatalog[0] ??
+        emptySelection)
+      : selectedDocument;
+  const lastAudience = useRef("public");
+  const writer =
+    online &&
+    canWrite(account.profile, !!account.user?.emailVerified, account.fresh);
+  const administrator = writer && account.profile?.role === "admin";
   const play = view === "editor" && editor ? editor.play : selected;
   const phase =
     play.phases.find((p) => p.id === route[index]) ??
@@ -175,13 +232,13 @@ export function App() {
         if (live) setRepo(r);
         const [l, c, d] = await Promise.all([
           r.load(),
-          r.loadCatalog(),
+          r.loadCatalog("public"),
           r.loadDraft(),
         ]);
         if (live) {
           setLibrary(l);
           setCatalog(c);
-          setSelected(selectCatalog(c).plays[0]);
+          setSelected(selectCatalog(c).plays[0] ?? emptySelection);
           setDraft(d);
           setCatalogUrl(l.catalogUrl);
         }
@@ -193,6 +250,92 @@ export function App() {
       live = false;
     };
   }, []);
+  useEffect(() => {
+    if (!repo || account.loading) return;
+    const previousAudience = lastAudience.current;
+    lastAudience.current = audience;
+    if (previousAudience !== "public" && previousAudience !== audience) {
+      void repo.clearCatalog(previousAudience);
+      void repo.saveDraft(null, previousAudience);
+      if (editor?.shared || draftOwner === previousAudience) {
+        setEditor(null);
+        setDraft(null);
+        setDraftOwner(undefined);
+        void repo.loadDraft().then(setDraft);
+        setView("library");
+      }
+    }
+    void repo.discardLegacyCatalog();
+    let live = true;
+    const cloud = account.services;
+    setCloudStatus("Központi taktikatár ellenőrzése…");
+    void repo
+      .loadCatalog(audience)
+      .then(async (cached) => {
+        if (!live) return;
+        const current = selectCatalog(
+          cached,
+          teamMember ? account.user?.uid : undefined,
+        );
+        if (audience !== "public") {
+          const localDraft = await repo.loadDraft();
+          const sharedDraft = await repo.loadDraft(audience);
+          if (live && !localDraft && sharedDraft) {
+            setDraft(sharedDraft);
+            setDraftOwner(audience);
+          }
+        }
+        setCatalog(current);
+        if (!online) return;
+        const source = library?.catalogUrl
+          ? new HttpCatalogSource(library.catalogUrl)
+          : cloud
+            ? new FirestoreCatalogSource(cloud, current, audience)
+            : import.meta.env.DEV
+              ? new HttpCatalogSource(
+                  new URL("/catalog/catalog.json", location.href).href,
+                )
+              : null;
+        if (!source) return;
+        const result = await source.fetch();
+        const fetched =
+          source instanceof HttpCatalogSource
+            ? {
+                ...result,
+                audience,
+                plays:
+                  audience === "public"
+                    ? result.plays.filter((p) => !p.requiresAuth).slice(0, 5)
+                    : result.plays,
+              }
+            : result;
+        if (!live) return;
+        const updated = await repo.updateCatalog(
+          { fetch: async () => fetched },
+          current.contentVersion,
+        );
+        if (!live) return;
+        setCatalog(updated);
+        setSelected(
+          (currentPlay) =>
+            updated.plays.find((p) => p.id === currentPlay.id) ?? currentPlay,
+        );
+        setCloudStatus("A központi taktikatár naprakész.");
+      })
+      .catch((e) => {
+        if (live) setCloudStatus(cloudError(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [
+    repo,
+    account.services,
+    account.loading,
+    audience,
+    online,
+    library?.catalogUrl,
+  ]);
   useEffect(() => {
     const on = () => setOnline(navigator.onLine);
     const ready = (e: Event) => {
@@ -233,7 +376,7 @@ export function App() {
     if (!dirty) {
       setDraftStatus("Taktika mentve");
       void repo
-        .saveDraft(null)
+        .saveDraft(null, editor.shared ? audience : undefined)
         .then(() => setDraft(null))
         .catch((e) => notice(errorText(e), true));
       return;
@@ -241,10 +384,11 @@ export function App() {
     setDraftStatus("Mentés…");
     const timer = setTimeout(() => {
       repo
-        .saveDraft(editor.play)
+        .saveDraft(editor.play, editor.shared ? audience : undefined)
         .then(() => {
           setDraftStatus("Piszkozat mentve");
           setDraft(editor.play);
+          setDraftOwner(editor.shared ? audience : undefined);
         })
         .catch((e) => {
           setDraftStatus("A mentés sikertelen");
@@ -252,7 +396,7 @@ export function App() {
         });
     }, 500);
     return () => clearTimeout(timer);
-  }, [editor?.play, repo, dirty]);
+  }, [editor?.play, repo, dirty, audience, editor?.shared]);
   useEffect(() => {
     setRoute([play.entryPhaseId]);
     setIndex(0);
@@ -319,8 +463,14 @@ export function App() {
     const action = () => {
       const editable =
         alreadyOwned || newDocument ? structuredClone(p) : copyPlay(p);
+      if (!alreadyOwned && !newDocument && language === "en")
+        editable.title = `${playText(p, p.title).slice(0, 108)} · personal`;
       setEditor({
         play: editable,
+        shared:
+          alreadyOwned &&
+          !library?.plays.some((owned) => owned.id === p.id) &&
+          allCatalog.some((item) => item.id === p.id),
         undo: [],
         redo: [],
         saved: alreadyOwned ? JSON.stringify(editable) : "",
@@ -352,10 +502,12 @@ export function App() {
       setCategory("");
       setFavoritesOnly(false);
       setSelected(
-        v === "library" ? allCatalog[0] : (library?.plays[0] ?? allCatalog[0]),
+        v === "library"
+          ? (allCatalog[0] ?? emptySelection)
+          : (library?.plays[0] ?? allCatalog[0] ?? emptySelection),
       );
     }
-    if (v === "editor" && !editor) openEditor(newPlay(), false, true);
+    if (v === "editor" && !editor) openEditor(newLocalPlay(), false, true);
     else setView(v);
   }
   async function saveEditor() {
@@ -523,8 +675,35 @@ export function App() {
     if (!repo || !library) return;
     setUpdating(true);
     try {
+      const source = catalogUrl.trim()
+        ? new HttpCatalogSource(catalogUrl.trim())
+        : account.services
+          ? new FirestoreCatalogSource(
+              account.services,
+              activeCatalog,
+              audience,
+            )
+          : null;
+      if (!source)
+        throw new Error(
+          "Adj meg katalóguscímet, vagy állítsd be a Firebase-kapcsolatot.",
+        );
+      const fetched = await source.fetch();
+      if (audienceRef.current !== audience) return;
+      const visible = catalogUrl.trim()
+        ? {
+            ...fetched,
+            audience,
+            plays:
+              audience === "public"
+                ? fetched.plays.filter((p) => !p.requiresAuth).slice(0, 5)
+                : fetched.plays,
+          }
+        : fetched;
+      if (!visible.plays.length)
+        throw new Error("A katalógusban nincs nyilvános taktika.");
       const result = await repo.updateCatalog(
-        new HttpCatalogSource(catalogUrl.trim()),
+        { fetch: async () => visible },
         activeCatalog.contentVersion,
       );
       setCatalog(result);
@@ -532,11 +711,75 @@ export function App() {
       const replacement = result.plays.find((p) => p.id === selected.id);
       if (replacement) setSelected(replacement);
       notice(`A taktikatár frissült (${result.plays.length} taktika).`);
+      setCloudStatus("A központi taktikatár naprakész.");
     } catch (e) {
       notice(errorText(e), true);
     } finally {
       setUpdating(false);
     }
+  }
+  function requestPublication(value: Play, remove = false) {
+    if (!writer || publishing || !account.services || !repo) return;
+    if (activeCatalog.audience !== audience || !activeCatalog.cloud) {
+      notice("A közzététel előtt töltsd le a teljes közös taktikatárat.", true);
+      return;
+    }
+    if (library?.catalogUrl) {
+      notice(
+        "A közzététel előtt válts a Firebase taktikatárra a Beállításokban: töröld a katalógus HTTPS-címét, majd frissíts.",
+        true,
+      );
+      return;
+    }
+    setConfirm({
+      title: remove
+        ? "Taktika eltávolítása a közös tárból?"
+        : "Taktika közzététele?",
+      body: remove
+        ? `„${value.title}” kikerül a közös taktikatárból. A helyi saját mentések megmaradnak.`
+        : `„${value.title}” ${value.requiresAuth ? "bejelentkezés után" : "bejelentkezés nélkül is"} elérhető lesz a közös taktikatárban.${allCatalog.some((p) => p.id === value.id) ? " A korábbi közös változatot felváltja." : ""}`,
+      action: () => {
+        void (async () => {
+          setPublishing(true);
+          setMessage(null);
+          try {
+            const plays = remove
+              ? allCatalog.filter((p) => p.id !== value.id)
+              : replaceCatalogPlay(activeCatalog, value);
+            const result = await publishCatalog(
+              account.services!,
+              activeCatalog,
+              plays,
+            );
+            setCatalog(result);
+            if (remove && selected.id === value.id)
+              setSelected(result.plays[0]);
+            else if (selected.id === value.id)
+              setSelected(result.plays.find((p) => p.id === value.id)!);
+            try {
+              await repo.updateCatalog(
+                { fetch: async () => result },
+                result.contentVersion,
+              );
+              notice(
+                remove
+                  ? "A taktika kikerült a közös tárból."
+                  : "A taktika megjelent a közös tárban.",
+              );
+            } catch {
+              notice(
+                "A közzététel sikeres, de az offline másolat mentése nem sikerült. Frissítsd a taktikatárat, ha újra van hely a helyi tárolón.",
+                true,
+              );
+            }
+          } catch (e) {
+            notice(cloudError(e), true);
+          } finally {
+            setPublishing(false);
+          }
+        })();
+      },
+    });
   }
   async function installApp() {
     if (install) {
@@ -554,9 +797,9 @@ export function App() {
     return (
       <main className="startup">
         <BookOpen size={40} />
-        <h1>A helyi adatok nem tölthetők be</h1>
-        <p>{fatal}</p>
-        <p>A fájlokat megőriztük. Exportáld őket a javítás előtt.</p>
+        <h1>{t("A helyi adatok nem tölthetők be")}</h1>
+        <p>{t(fatal)}</p>
+        <p>{t("A fájlokat megőriztük. Exportáld őket a javítás előtt.")}</p>
         <button
           className="button primary"
           onClick={async () => {
@@ -569,10 +812,10 @@ export function App() {
             }
           }}
         >
-          Helyi fájl exportálása
+          {t("Helyi fájl exportálása")}
         </button>
         <button className="button" onClick={() => location.reload()}>
-          Újrapróbálás
+          {t("Újrapróbálás")}
         </button>
       </main>
     );
@@ -580,16 +823,16 @@ export function App() {
     return (
       <main className="startup">
         <BookOpen size={40} />
-        <h1>Edzői műhely</h1>
-        <p>Taktikatár megnyitása…</p>
+        <h1>{t("Edzői műhely")}</h1>
+        <p>{t("Taktikatár megnyitása…")}</p>
       </main>
     );
   const items = view === "own" ? library.plays : allCatalog;
   const filtered = items.filter(
     (p) =>
       (!query ||
-        `${p.title} ${p.description} ${p.tags.join(" ")}`
-          .toLocaleLowerCase("hu")
+        `${playText(p, p.title)} ${p.description} ${p.tags.join(" ")}`
+          .toLocaleLowerCase(language)
           .includes(query.toLocaleLowerCase("hu"))) &&
       (!defense || p.defense === defense) &&
       (!age || p.ageGroup === age) &&
@@ -605,7 +848,7 @@ export function App() {
         type="file"
         accept=".json,application/json"
         className="visually-hidden"
-        aria-label="Taktika JSON importálása"
+        aria-label={t("Taktika JSON importálása")}
         onChange={(e) => {
           const f = e.target.files?.[0];
           e.target.value = "";
@@ -615,7 +858,7 @@ export function App() {
       {menuOpen && (
         <button
           className="sidebar-scrim"
-          aria-label="Menü bezárása"
+          aria-label={t("Menü bezárása")}
           onClick={() => setMenuOpen(false)}
         />
       )}
@@ -632,30 +875,32 @@ export function App() {
             <Activity size={24} />
           </span>
           <span>
-            HANDBALL
+            {t("HANDBALL")}
             <strong>
-              TACTICS<span className="brand-dot">.</span>
+              {t("PLAYLAB")}
+              <span className="brand-dot">.</span>
             </strong>
           </span>
         </a>
-        <div className="sidebar-label">EDZŐI MŰHELY</div>
-        <nav aria-label="Főmenü">
+        <div className="sidebar-label">{t("EDZŐI MŰHELY")}</div>
+        <nav aria-label={t("Főmenü")}>
           {(
             [
               {
                 id: "library",
-                label: "Taktikatár",
+                label: t("Taktikatár"),
                 icon: BookOpen,
                 count: allCatalog.length,
               },
               {
                 id: "own",
-                label: "Saját taktikák",
+                label: t("Saját taktikák"),
                 icon: FolderOpen,
                 count: library.plays.length,
               },
-              { id: "editor", label: "Szerkesztő", icon: MousePointer2 },
-              { id: "settings", label: "Beállítások", icon: Settings2 },
+              { id: "editor", label: t("Szerkesztő"), icon: MousePointer2 },
+              { id: "settings", label: t("Beállítások"), icon: Settings2 },
+              { id: "account", label: t("Fiók"), icon: UserRound },
             ] as const
           ).map((n) => (
             <button
@@ -664,48 +909,59 @@ export function App() {
               onClick={() => navigate(n.id)}
             >
               <n.icon size={19} />
-              <span>{n.label}</span>
+              <span>{t(n.label)}</span>
               {"count" in n && <span className="nav-count">{n.count}</span>}
             </button>
           ))}
+          {administrator && (
+            <button
+              className={`nav-item ${view === "users" ? "active" : ""}`}
+              onClick={() => navigate("users")}
+            >
+              <UsersRound size={19} />
+              <span>{t("Felhasználók")}</span>
+            </button>
+          )}
         </nav>
         <div className="sidebar-tip">
           <span className="tip-icon">
             <CircleHelp size={19} />
           </span>
-          <h3>A jó játék döntésekkel kezdődik.</h3>
+          <h3>{t("A jó játék döntésekkel kezdődik.")}</h3>
           <p>
-            Válassz egy figurát, figyeld a védelmet, és próbáld ki a
-            folytatásokat.
+            {t(
+              "Válassz egy figurát, figyeld a védelmet, és próbáld ki a folytatásokat.",
+            )}
           </p>
           <button
             onClick={() => {
               setView("library");
-              setSelected(allCatalog[0]);
-              setRoute([allCatalog[0].entryPhaseId]);
+              setSelected(allCatalog[0] ?? emptySelection);
+              setRoute([(allCatalog[0] ?? emptySelection).entryPhaseId]);
               setIndex(0);
               setTime(0);
             }}
           >
-            Nézd meg a mintát <ArrowRight size={15} />
+            {t("Nézd meg a mintát")}
+            <ArrowRight size={15} />
           </button>
         </div>
         <div className="sidebar-bottom">
           <button className="install-link" onClick={() => void installApp()}>
             <Download size={17} />
-            App telepítése
+            {t("App telepítése")}
           </button>
           <div className="local-status">
             <span className={`status-dot ${offlineReady ? "ready" : ""}`} />
             <span>
               {offlineReady
-                ? "Offline használatra kész"
+                ? t("Offline használatra kész")
                 : online
-                  ? "Helyi mentés bekapcsolva"
-                  : "Internet nélkül"}
+                  ? t("Helyi mentés bekapcsolva")
+                  : t("Internet nélkül")}
             </span>
           </div>
-          <small>HANDBALL TACTICS · 0.1</small>
+          <small>{t("HANDBALL PLAYLAB · 0.1")}</small>
         </div>
       </aside>
       <div className="main-shell">
@@ -713,85 +969,153 @@ export function App() {
           <div className="topbar-left">
             <button
               className="icon-button mobile-menu"
-              aria-label="Menü megnyitása"
+              aria-label={t("Menü megnyitása")}
               onClick={() => setMenuOpen(true)}
             >
               <Menu size={21} />
             </button>
-            <span>Edzői műhely</span>
+            <span>{t("Edzői műhely")}</span>
             <ChevronRight size={14} />
             <strong>
               {view === "library"
-                ? "Taktikatár"
+                ? t("Taktikatár")
                 : view === "own"
-                  ? "Saját taktikák"
+                  ? t("Saját taktikák")
                   : view === "editor"
-                    ? "Szerkesztő"
-                    : "Beállítások"}
+                    ? t("Szerkesztő")
+                    : view === "account"
+                      ? t("Fiók")
+                      : view === "users"
+                        ? t("Felhasználók")
+                        : t("Beállítások")}
             </strong>
           </div>
           <div className="topbar-actions">
+            <select
+              className="language-selector"
+              aria-label="Nyelv / Language"
+              value={language}
+              onChange={(e) => changeLanguage(e.target.value as "hu" | "en")}
+            >
+              <option value="hu">Magyar</option>
+              <option value="en">English</option>
+            </select>
             <span className="connection" title={online ? "Online" : "Offline"}>
               {online ? <Wifi size={15} /> : <WifiOff size={15} />}
               <span>{online ? "Online" : "Offline"}</span>
             </span>
             <button
               className="button primary"
-              onClick={() => openEditor(newPlay(), false, true)}
+              onClick={() => openEditor(newLocalPlay(), false, true)}
             >
               <Plus size={17} />
-              <span>Új taktika</span>
+              <span>{t("Új taktika")}</span>
             </button>
           </div>
         </header>
         <main className="main-content">
+          {view === "account" && (
+            <>
+              <section className="page-intro">
+                <div>
+                  <span className="eyebrow">{t("KÖZÖS MŰHELY")}</span>
+                  <h1>{t("A fiókod.")}</h1>
+                  <p>
+                    {t("Bejelentkezés és hozzáférés a közös taktikatárhoz.")}
+                  </p>
+                </div>
+              </section>
+              <div className="settings-grid">
+                <AccountPanel account={account} online={online} />
+              </div>
+            </>
+          )}
+          {view === "users" &&
+            (administrator && account.services ? (
+              <UserManagement cloud={account.services} online={online} />
+            ) : (
+              <section className="settings-card">
+                <h2>{t("Adminisztrátori hozzáférés szükséges")}</h2>
+                <p>
+                  {t(
+                    "Ehhez az oldalhoz megerősített e-mail-cím, aktív adminisztrátori jogosultság és internetkapcsolat kell.",
+                  )}
+                </p>
+                <button className="button" onClick={() => navigate("account")}>
+                  {t("Fiók megnyitása")}
+                </button>
+              </section>
+            ))}
           {needRefresh && (
             <div className="notice-banner">
-              <span>Új alkalmazásverzió érhető el.</span>
+              <span>{t("Új alkalmazásverzió érhető el.")}</span>
               <button
                 className="button small"
                 disabled={dirty}
                 onClick={() => void updateServiceWorker(true)}
               >
-                {dirty ? "Előbb mentsd a taktikát" : "Frissítés"}
+                {dirty ? t("Előbb mentsd a taktikát") : t("Frissítés")}
               </button>
             </div>
           )}
-          {draft && !editor && (view === "library" || view === "own") && (
-            <div className="notice-banner">
-              <span>
-                Mentett piszkozat:{" "}
-                <strong>{draft.title || "Névtelen taktika"}</strong>
-              </span>
-              <div>
-                <button
-                  className="button small"
-                  onClick={() => {
-                    setEditor({ play: draft, undo: [], redo: [], saved: "" });
-                    setView("editor");
-                  }}
-                >
-                  Folytatás
-                </button>
-                <button
-                  className="icon-button"
-                  aria-label="Piszkozat elvetése"
-                  onClick={() =>
-                    setConfirm({
-                      title: "Piszkozat elvetése?",
-                      body: "Az el nem mentett szerkesztés törlődik.",
-                      action: () => {
-                        void repo!
-                          .saveDraft(null)
-                          .then(() => setDraft(null))
-                          .catch((e) => notice(errorText(e), true));
-                      },
-                    })
-                  }
-                >
-                  <X size={17} />
-                </button>
+          {draft &&
+            (!draftOwner || draftOwner === audience) &&
+            !editor &&
+            (view === "library" || view === "own") && (
+              <div className="notice-banner">
+                <span>
+                  {t("Mentett piszkozat:")}{" "}
+                  <strong>{draft.title || t("Névtelen taktika")}</strong>
+                </span>
+                <div>
+                  <button
+                    className="button small"
+                    onClick={() => {
+                      setEditor({
+                        play: draft,
+                        undo: [],
+                        redo: [],
+                        saved: "",
+                        shared: !!draftOwner,
+                      });
+                      setView("editor");
+                    }}
+                  >
+                    {t("Folytatás")}
+                  </button>
+                  <button
+                    className="icon-button"
+                    aria-label={t("Piszkozat elvetése")}
+                    onClick={() =>
+                      setConfirm({
+                        title: "Piszkozat elvetése?",
+                        body: "Az el nem mentett szerkesztés törlődik.",
+                        action: () => {
+                          void repo!
+                            .saveDraft(null, draftOwner)
+                            .then(() => {
+                              setDraft(null);
+                              setDraftOwner(undefined);
+                            })
+                            .catch((e) => notice(errorText(e), true));
+                        },
+                      })
+                    }
+                  >
+                    <X size={17} />
+                  </button>
+                </div>
               </div>
+            )}
+          {view === "library" && !teamMember && (
+            <div className="notice-banner public-catalog-notice">
+              <span>{t`Nyilvánosan ${allCatalog.length} taktika érhető el. A teljes csapatkatalógushoz meghívás és megerősített e-mail-cím szükséges.`}</span>
+              <button
+                className="button small"
+                onClick={() => navigate("account")}
+              >
+                {t("Bejelentkezés")}
+              </button>
             </div>
           )}
           {(view === "library" || view === "own") && (
@@ -800,24 +1124,28 @@ export function App() {
                 <div>
                   <span className="eyebrow">
                     {view === "library"
-                      ? "A JÁTÉK MÖGÖTTI GONDOLAT"
-                      : "A TE JÁTÉKOD"}
+                      ? t("A JÁTÉK MÖGÖTTI GONDOLAT")
+                      : t("A TE JÁTÉKOD")}
                   </span>
                   <h1>
                     {view === "library" ? (
                       <>
-                        Minden jó támadás
+                        {t("Minden jó támadás")}
                         <br />
-                        <span>egy ötlettel kezdődik.</span>
+                        <span>{t("egy ötlettel kezdődik.")}</span>
                       </>
                     ) : (
-                      "Saját taktikák."
+                      t("Saját taktikák.")
                     )}
                   </h1>
                   <p>
                     {view === "library"
-                      ? "Taktikai építőkockák, mozgássorok és döntési helyzetek."
-                      : "A csapatodhoz alakított figurák, ezen az eszközön elmentve."}
+                      ? t(
+                          "Taktikai építőkockák, mozgássorok és döntési helyzetek.",
+                        )
+                      : t(
+                          "A csapatodhoz alakított figurák, ezen az eszközön elmentve.",
+                        )}
                   </p>
                 </div>
                 <div className="intro-note">
@@ -825,9 +1153,9 @@ export function App() {
                     {String(items.length).padStart(2, "0")}
                   </span>
                   <span>
-                    {view === "library" ? "szemléltető" : "saját"}
+                    {view === "library" ? t("szemléltető") : t("saját")}
                     <br />
-                    taktika
+                    {t("taktika")}
                   </span>
                 </div>
               </section>
@@ -835,15 +1163,15 @@ export function App() {
                 <div className="search-field">
                   <Search size={18} />
                   <input
-                    aria-label="Taktikák keresése"
-                    placeholder="Keress taktikát, mozgást…"
+                    aria-label={t("Taktikák keresése")}
+                    placeholder={t("Keress taktikát, mozgást…")}
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
                   />
                   {query && (
                     <button
                       className="icon-button"
-                      aria-label="Keresés törlése"
+                      aria-label={t("Keresés törlése")}
                       onClick={() => setQuery("")}
                     >
                       <X size={15} />
@@ -851,28 +1179,32 @@ export function App() {
                   )}
                 </div>
                 <select
-                  aria-label="Védekezés szűrése"
+                  aria-label={t("Védekezés szűrése")}
                   value={defense}
                   onChange={(e) => setDefense(e.target.value)}
                 >
-                  <option value="">Minden védekezés</option>
+                  <option value="">{t("Minden védekezés")}</option>
                   {unique(items.map((p) => p.defense)).map((d) => (
-                    <option key={d}>{d}</option>
+                    <option key={d} value={d}>
+                      {t(d)}
+                    </option>
                   ))}
                 </select>
                 <select
-                  aria-label="Korosztály szűrése"
+                  aria-label={t("Korosztály szűrése")}
                   value={age}
                   onChange={(e) => setAge(e.target.value)}
                 >
-                  <option value="">Minden korosztály</option>
+                  <option value="">{t("Minden korosztály")}</option>
                   {unique(items.map((p) => p.ageGroup)).map((d) => (
-                    <option key={d}>{d}</option>
+                    <option key={d} value={d}>
+                      {t(d)}
+                    </option>
                   ))}
                 </select>
                 <button
                   className={`icon-button filter-heart ${favoritesOnly ? "chosen" : ""}`}
-                  aria-label="Csak kedvencek"
+                  aria-label={t("Csak kedvencek")}
                   aria-pressed={favoritesOnly}
                   onClick={() => setFavoritesOnly(!favoritesOnly)}
                 >
@@ -884,21 +1216,25 @@ export function App() {
                   onClick={() => uploadRef.current?.click()}
                 >
                   <Upload size={16} />
-                  <span>Import</span>
+                  <span>{t("Import")}</span>
                 </button>
               </div>
               <div className="catalog-workspace">
-                <section className="catalog-list" aria-label="Taktikák">
+                <section className="catalog-list" aria-label={t("Taktikák")}>
                   <div className="list-heading">
-                    <span>{filtered.length} taktika</span>
+                    <span>
+                      {filtered.length} {t("taktika")}
+                    </span>
                     <select
-                      aria-label="Kategória szűrése"
+                      aria-label={t("Kategória szűrése")}
                       value={category}
                       onChange={(e) => setCategory(e.target.value)}
                     >
-                      <option value="">Minden kategória</option>
+                      <option value="">{t("Minden kategória")}</option>
                       {unique(items.map((p) => p.category)).map((d) => (
-                        <option key={d}>{d}</option>
+                        <option key={d} value={d}>
+                          {t(d)}
+                        </option>
                       ))}
                     </select>
                   </div>
@@ -925,33 +1261,39 @@ export function App() {
                                 }),
                             );
                         }}
-                        aria-label={`${p.title} megnyitása`}
+                        aria-label={t`${playText(p, p.title)} megnyitása`}
                       >
                         <div className="card-top">
                           <span className="card-index">
                             {String(i + 1).padStart(2, "0")}
                           </span>
-                          <span className="category-label">{p.category}</span>
+                          <span className="category-label">
+                            {playText(p, p.category)}
+                          </span>
                           <span
                             className={`difficulty difficulty-${p.difficulty === "Kezdő" ? "easy" : p.difficulty === "Haladó" ? "hard" : "medium"}`}
-                            title={p.difficulty}
+                            title={t(p.difficulty)}
                           >
                             <i />
                             <i />
                             <i />
                           </span>
                         </div>
-                        <h3>{p.title}</h3>
+                        <h3>{playText(p, p.title)}</h3>
                         <div className="card-bottom">
-                          <span>{p.defense} ellen</span>
-                          <span>{p.ageGroup}</span>
-                          <span>{p.phases.length} fázis</span>
+                          <span>
+                            {t(p.defense)} {t("ellen")}
+                          </span>
+                          <span>{t(p.ageGroup)}</span>
+                          <span>
+                            {p.phases.length} {t("fázis")}
+                          </span>
                           <ChevronRight size={16} />
                         </div>
                       </button>
                       <button
                         className="card-favorite icon-button"
-                        aria-label={`${p.title} ${library.favorites.includes(p.id) ? "eltávolítása a kedvencekből" : "kedvencekhez adása"}`}
+                        aria-label={t`${playText(p, p.title)} ${library.favorites.includes(p.id) ? "eltávolítása a kedvencekből" : "kedvencekhez adása"}`}
                         aria-pressed={library.favorites.includes(p.id)}
                         disabled={busy}
                         onClick={() => void favorite(p.id)}
@@ -972,13 +1314,19 @@ export function App() {
                       <FolderOpen size={34} />
                       <h3>
                         {items.length
-                          ? "Nincs találat"
-                          : "Az első saját figurád helye"}
+                          ? t("Nincs találat")
+                          : view === "library"
+                            ? t("Taktikatár megnyitása…")
+                            : t("Az első saját figurád helye")}
                       </h3>
                       <p>
                         {items.length
-                          ? "Próbálj más keresést vagy töröld a szűrőket."
-                          : "Indulj egy mintából, vagy készíts új taktikát."}
+                          ? t("Próbálj más keresést vagy töröld a szűrőket.")
+                          : view === "library"
+                            ? t(cloudStatus || "Taktikatár megnyitása…")
+                            : t(
+                                "Indulj egy mintából, vagy készíts új taktikát.",
+                              )}
                       </p>
                       <button
                         className="button"
@@ -989,137 +1337,176 @@ export function App() {
                               setAge(""),
                               setCategory(""),
                               setFavoritesOnly(false))
-                            : openEditor(newPlay(), false, true)
+                            : openEditor(newLocalPlay(), false, true)
                         }
                       >
-                        {items.length ? "Szűrők törlése" : "Új taktika"}
+                        {items.length ? t("Szűrők törlése") : t("Új taktika")}
                       </button>
                     </div>
                   )}
                 </section>
-                <section className="play-detail">
-                  <div className="detail-header">
-                    <div>
-                      <span className="eyebrow">
-                        {owned ? "SAJÁT TAKTIKA" : "TAKTIKAI MINTA"}
-                      </span>
-                      <h2>{selected.title}</h2>
-                    </div>
-                    <button
-                      className="icon-button"
-                      title="JSON exportálása"
-                      aria-label="Kiválasztott taktika exportálása"
-                      onClick={() =>
-                        void doExport("handball-tactic.json", selected)
-                      }
-                    >
-                      <ArrowDownToLine size={19} />
-                    </button>
-                  </div>
-                  <div className="detail-tags">
-                    <span>{selected.defense} ellen</span>
-                    <span>{selected.ageGroup}</span>
-                    <span>{selected.difficulty}</span>
-                    <span>{selected.formation}</span>
-                  </div>
-                  {renderBoard(false)}
-                  <div className="detail-description">
-                    <p>{selected.description}</p>
-                    <div className="coaching">
-                      <span className="eyebrow">EDZŐI SZEMPONTOK</span>
-                      {selected.coachingPoints.map((p, i) => (
-                        <p key={i}>
-                          <Check size={14} />
-                          {p}
-                        </p>
-                      ))}
-                    </div>
-                    {!owned && (
-                      <p className="sample-note">
-                        Szemléltető minta. A csapat és a korosztály igényei
-                        szerint, edzői ellenőrzéssel használd.
-                      </p>
-                    )}
-                    {selected.sources.some((s) =>
-                      /^https?:\/\//i.test(s.url),
-                    ) && (
-                      <div className="teaching-sources">
-                        <span className="eyebrow">KAPCSOLÓDÓ TANANYAGOK</span>
-                        <p>
-                          Az animáció saját szemléltető feldolgozás; a
-                          hivatkozások a kapcsolódó taktikai alapelvekhez
-                          vezetnek.
-                        </p>
-                        {selected.sources
-                          .filter((s) => /^https?:\/\//i.test(s.url))
-                          .map((s) => (
-                            <a
-                              key={s.url}
-                              href={s.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              {s.title}
-                              <ArrowRight size={13} />
-                            </a>
-                          ))}
-                      </div>
-                    )}
-                    <div className="detail-buttons">
-                      <button
-                        className="button primary"
-                        onClick={() => openEditor(selected, owned)}
-                      >
-                        {owned ? (
-                          <MousePointer2 size={17} />
-                        ) : (
-                          <Copy size={17} />
-                        )}
-                        <span>
-                          {owned
-                            ? "Taktika szerkesztése"
-                            : "Saját változat készítése"}
+                {items.length > 0 && (
+                  <section className="play-detail">
+                    <div className="detail-header">
+                      <div>
+                        <span className="eyebrow">
+                          {owned ? t("SAJÁT TAKTIKA") : t("TAKTIKAI MINTA")}
                         </span>
+                        <h2>{playText(selected, selected.title)}</h2>
+                      </div>
+                      <button
+                        className="icon-button"
+                        title={t("JSON exportálása")}
+                        aria-label={t("Kiválasztott taktika exportálása")}
+                        onClick={() =>
+                          void doExport("handball-tactic.json", selected)
+                        }
+                      >
+                        <ArrowDownToLine size={19} />
                       </button>
-                      {owned && (
-                        <button
-                          className="button danger-text"
-                          disabled={busy}
-                          onClick={() =>
-                            setConfirm({
-                              title: "Taktika törlése?",
-                              body: `„${selected.title}” törlődik erről az eszközről. Az exportált fájlok megmaradnak.`,
-                              action: () => {
-                                void persist({
-                                  ...library,
-                                  plays: library.plays.filter(
-                                    (p) => p.id !== selected.id,
-                                  ),
-                                  favorites: library.favorites.filter(
-                                    (id) => id !== selected.id,
-                                  ),
-                                })
-                                  .then(() => {
-                                    setSelected(allCatalog[0]);
-                                    if (editor?.play.id === selected.id) {
-                                      setEditor(null);
-                                      void repo!.saveDraft(null);
-                                      setDraft(null);
-                                    }
-                                    notice("A taktika törölve.");
-                                  })
-                                  .catch((e) => notice(errorText(e), true));
-                              },
-                            })
-                          }
-                        >
-                          <Trash2 size={17} />
-                          Törlés
-                        </button>
-                      )}
                     </div>
-                  </div>
-                </section>
+                    <div className="detail-tags">
+                      <span>
+                        {t(selected.defense)} {t("ellen")}
+                      </span>
+                      <span>{t(selected.ageGroup)}</span>
+                      <span>{t(selected.difficulty)}</span>
+                      <span>{selected.formation}</span>
+                    </div>
+                    {renderBoard(false)}
+                    <div className="detail-description">
+                      <p>{playText(selected, selected.description)}</p>
+                      <div className="coaching">
+                        <span className="eyebrow">{t("EDZŐI SZEMPONTOK")}</span>
+                        {selected.coachingPoints.map((p, i) => (
+                          <p key={i}>
+                            <Check size={14} />
+                            {playText(selected, p)}
+                          </p>
+                        ))}
+                      </div>
+                      {!owned && (
+                        <p className="sample-note">
+                          {t(
+                            "Szemléltető minta. A csapat és a korosztály igényei szerint, edzői ellenőrzéssel használd.",
+                          )}
+                        </p>
+                      )}
+                      {selected.sources.some((s) =>
+                        /^https?:\/\//i.test(s.url),
+                      ) && (
+                        <div className="teaching-sources">
+                          <span className="eyebrow">
+                            {t("KAPCSOLÓDÓ TANANYAGOK")}
+                          </span>
+                          <p>
+                            {t(
+                              "Az animáció saját szemléltető feldolgozás; a hivatkozások a kapcsolódó taktikai alapelvekhez vezetnek.",
+                            )}
+                          </p>
+                          {selected.sources
+                            .filter((s) => /^https?:\/\//i.test(s.url))
+                            .map((s) => (
+                              <a
+                                key={s.url}
+                                href={s.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                {playText(selected, s.title)}
+                                <ArrowRight size={13} />
+                              </a>
+                            ))}
+                        </div>
+                      )}
+                      <div className="detail-buttons">
+                        {writer && !owned && (
+                          <>
+                            <button
+                              className="button"
+                              disabled={publishing}
+                              onClick={() => openEditor(selected, true)}
+                            >
+                              <MousePointer2 size={17} />
+                              {t("Közös taktika szerkesztése")}
+                            </button>
+                            <button
+                              className="button danger-text"
+                              disabled={publishing || allCatalog.length <= 1}
+                              onClick={() => requestPublication(selected, true)}
+                            >
+                              {t("Eltávolítás a közös tárból")}
+                            </button>
+                          </>
+                        )}
+                        {writer && owned && (
+                          <button
+                            className="button"
+                            disabled={publishing}
+                            onClick={() => requestPublication(selected)}
+                          >
+                            {publishing
+                              ? t("Közzététel…")
+                              : t("Közzététel a közös tárban")}
+                          </button>
+                        )}
+                        <button
+                          className="button primary"
+                          onClick={() => openEditor(selected, owned)}
+                        >
+                          {owned ? (
+                            <MousePointer2 size={17} />
+                          ) : (
+                            <Copy size={17} />
+                          )}
+                          <span>
+                            {owned
+                              ? t("Taktika szerkesztése")
+                              : t("Saját változat készítése")}
+                          </span>
+                        </button>
+                        {owned && (
+                          <button
+                            className="button danger-text"
+                            disabled={busy}
+                            onClick={() =>
+                              setConfirm({
+                                title: "Taktika törlése?",
+                                body: `„${playText(selected, selected.title)}” törlődik erről az eszközről. Az exportált fájlok megmaradnak.`,
+                                action: () => {
+                                  void persist({
+                                    ...library,
+                                    plays: library.plays.filter(
+                                      (p) => p.id !== selected.id,
+                                    ),
+                                    favorites: library.favorites.filter(
+                                      (id) => id !== selected.id,
+                                    ),
+                                  })
+                                    .then(() => {
+                                      setSelected(
+                                        allCatalog[0] ?? emptySelection,
+                                      );
+                                      if (editor?.play.id === selected.id) {
+                                        setEditor(null);
+                                        void repo!.saveDraft(null);
+                                        setDraft(null);
+                                      }
+                                      notice("A taktika törölve.");
+                                    })
+                                    .catch((e) => notice(errorText(e), true));
+                                },
+                              })
+                            }
+                          >
+                            <Trash2 size={17} />
+                            {t("Törlés")}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </section>
+                )}
               </div>
             </>
           )}
@@ -1127,10 +1514,10 @@ export function App() {
             <>
               <section className="editor-heading">
                 <div>
-                  <span className="eyebrow">SAJÁT TAKTIKA</span>
+                  <span className="eyebrow">{t("SAJÁT TAKTIKA")}</span>
                   <input
                     className="title-input"
-                    aria-label="Taktika neve"
+                    aria-label={t("Taktika neve")}
                     value={editor.play.title}
                     maxLength={120}
                     onChange={(e) =>
@@ -1141,14 +1528,26 @@ export function App() {
                   />
                   <p>
                     <span className="status-dot ready" />
-                    {draftStatus || "Helyi piszkozat"}
-                    {dirty ? " · nem mentett változtatások" : ""}
+                    {t(draftStatus || "Helyi piszkozat")}
+                    {dirty ? t(" · nem mentett változtatások") : ""}
                   </p>
                 </div>
                 <div className="editor-heading-actions">
+                  {writer && (
+                    <button
+                      className="button"
+                      disabled={busy || publishing || !!problems.length}
+                      onClick={() => requestPublication(editor.play)}
+                    >
+                      <Upload size={17} />
+                      {publishing
+                        ? t("Közzététel…")
+                        : t("Közzététel a közös tárban")}
+                    </button>
+                  )}
                   <button
                     className="icon-button"
-                    aria-label="Visszavonás"
+                    aria-label={t("Visszavonás")}
                     disabled={!editor.undo.length}
                     onClick={() => {
                       const prev = editor.undo.at(-1)!;
@@ -1168,7 +1567,7 @@ export function App() {
                   </button>
                   <button
                     className="icon-button"
-                    aria-label="Ismétlés"
+                    aria-label={t("Ismétlés")}
                     disabled={!editor.redo.length}
                     onClick={() => {
                       const next = editor.redo[0];
@@ -1190,7 +1589,7 @@ export function App() {
                     onClick={() => void saveEditor()}
                   >
                     <Save size={17} />
-                    {busy ? "Mentés…" : "Taktika mentése"}
+                    {busy ? t("Mentés…") : t("Taktika mentése")}
                   </button>
                 </div>
               </section>
@@ -1202,7 +1601,7 @@ export function App() {
                       onClick={() => setTool("place")}
                     >
                       <MousePointer2 size={17} />
-                      {index === 0 ? "Kezdőhelyzet" : "Kijelölés"}
+                      {index === 0 ? t("Kezdőhelyzet") : t("Kijelölés")}
                     </button>
                     {actionKinds.map((k) => (
                       <button
@@ -1214,7 +1613,7 @@ export function App() {
                           setTime(0);
                         }}
                       >
-                        {actionLabels[k]}
+                        {t(actionLabels[k])}
                       </button>
                     ))}
                   </div>
@@ -1222,15 +1621,25 @@ export function App() {
                     <CircleHelp size={15} />
                     {tool === "place"
                       ? index === 0
-                        ? "Húzd a játékosokat a kezdőhelyükre. Billentyűzettel: kijelölés után a nyilakkal."
-                        : "Válassz játékost, majd mozgástípust a folytatás szerkesztéséhez."
+                        ? t(
+                            "Húzd a játékosokat a kezdőhelyükre. Billentyűzettel: kijelölés után a nyilakkal.",
+                          )
+                        : t(
+                            "Válassz játékost, majd mozgástípust a folytatás szerkesztéséhez.",
+                          )
                       : tool === "pass"
-                        ? "Válaszd a labdás játékost, majd koppints a passz céljátékosára."
-                        : "Válaszd a játékost, majd koppints a mozgás vagy lövés végpontjára a pályán."}
+                        ? t(
+                            "Válaszd a labdás játékost, majd koppints a passz céljátékosára.",
+                          )
+                        : t(
+                            "Válaszd a játékost, majd koppints a mozgás vagy lövés végpontjára a pályán.",
+                          )}
                   </div>
                   {renderBoard(true)}
                   <div className="editor-phase-list">
-                    <span className="eyebrow">FÁZISOK ÉS LEHETŐSÉGEK</span>
+                    <span className="eyebrow">
+                      {t("FÁZISOK ÉS LEHETŐSÉGEK")}
+                    </span>
                     <div>
                       {editor.play.phases.map((p, i) => (
                         <button
@@ -1239,7 +1648,7 @@ export function App() {
                           onClick={() => choosePhase(p.id)}
                         >
                           <span>{i + 1}</span>
-                          {p.title}
+                          {playText(play, p.title)}
                         </button>
                       ))}
                       <button
@@ -1251,16 +1660,86 @@ export function App() {
                         onClick={addPhase}
                       >
                         <Plus size={15} />
-                        Új folytatás
+                        {t("Új folytatás")}
                       </button>
                     </div>
                   </div>
                 </section>
                 <aside className="inspector">
-                  <details open>
-                    <summary>Taktika adatai</summary>
+                  <details>
+                    <summary>{t("Angol fordítás")}</summary>
                     <div className="inspector-fields">
-                      <Field label="Leírás">
+                      <p className="small-text muted">
+                        {t(
+                          "Az eredeti szövegek mellett itt adhatod meg az angol változatot. A hiányzó fordításnál az eredeti szöveg jelenik meg.",
+                        )}
+                      </p>
+                      {unique([
+                        editor.play.title,
+                        editor.play.description,
+                        editor.play.category,
+                        ...editor.play.tags,
+                        ...editor.play.coachingPoints,
+                        ...editor.play.phases.flatMap((ph) => [
+                          ph.title,
+                          ph.note,
+                          ...ph.next.map((n) => n.label),
+                        ]),
+                      ])
+                        .filter(Boolean)
+                        .map((text) => (
+                          <Field key={text} label={text}>
+                            <textarea
+                              aria-label={`${t("Angol fordítás")}: ${text}`}
+                              rows={2}
+                              maxLength={3000}
+                              value={
+                                editor.play.english?.[translationKey(text)] ??
+                                ""
+                              }
+                              onChange={(e) =>
+                                edit((p) => {
+                                  p.english = {
+                                    ...p.english,
+                                    [translationKey(text)]: e.target.value,
+                                  };
+                                })
+                              }
+                            />
+                          </Field>
+                        ))}
+                    </div>
+                  </details>
+                  <details open>
+                    <summary>{t("Taktika adatai")}</summary>
+                    <div className="inspector-fields">
+                      {writer && (
+                        <div className="catalog-access-field">
+                          <label className="check-field">
+                            <input
+                              type="checkbox"
+                              checked={editor.play.requiresAuth}
+                              onChange={(e) =>
+                                edit((p) => {
+                                  p.requiresAuth = e.target.checked;
+                                })
+                              }
+                            />
+                            {t("Bejelentkezés szükséges")}
+                          </label>
+                          <p className="small-text muted">
+                            {t(
+                              "A közös tárban legfeljebb 5 taktika lehet nyilvános. A beállítás közzétételkor lép életbe.",
+                            )}
+                          </p>
+                          <p className="small-text">
+                            {t("Nyilvános taktikák:")}{" "}
+                            {allCatalog.filter((p) => !p.requiresAuth).length} /
+                            5
+                          </p>
+                        </div>
+                      )}
+                      <Field label={t("Leírás")}>
                         <textarea
                           value={editor.play.description}
                           maxLength={3000}
@@ -1273,7 +1752,7 @@ export function App() {
                         />
                       </Field>
                       <div className="field-grid">
-                        <Field label="Védekezés">
+                        <Field label={t("Védekezés")}>
                           <select
                             value={editor.play.defense}
                             onChange={(e) =>
@@ -1291,11 +1770,13 @@ export function App() {
                               "Vegyes",
                               "Rendezetlen",
                             ].map((d) => (
-                              <option key={d}>{d}</option>
+                              <option key={d} value={d}>
+                                {t(d)}
+                              </option>
                             ))}
                           </select>
                         </Field>
-                        <Field label="Korosztály">
+                        <Field label={t("Korosztály")}>
                           <select
                             value={editor.play.ageGroup}
                             onChange={(e) =>
@@ -1306,12 +1787,14 @@ export function App() {
                           >
                             {["U10", "U12", "U14", "U16", "U18", "Felnőtt"].map(
                               (d) => (
-                                <option key={d}>{d}</option>
+                                <option key={d} value={d}>
+                                  {t(d)}
+                                </option>
                               ),
                             )}
                           </select>
                         </Field>
-                        <Field label="Nehézség">
+                        <Field label={t("Nehézség")}>
                           <select
                             value={editor.play.difficulty}
                             onChange={(e) =>
@@ -1322,11 +1805,13 @@ export function App() {
                             }
                           >
                             {["Kezdő", "Középhaladó", "Haladó"].map((d) => (
-                              <option key={d}>{d}</option>
+                              <option key={d} value={d}>
+                                {t(d)}
+                              </option>
                             ))}
                           </select>
                         </Field>
-                        <Field label="Kategória">
+                        <Field label={t("Kategória")}>
                           <select
                             value={editor.play.category}
                             onChange={(e) =>
@@ -1337,16 +1822,18 @@ export function App() {
                           >
                             {unique([
                               "Saját taktika",
-                              ...builtInPlays.map((p) => p.category),
+                              ...allCatalog.map((p) => p.category),
                               editor.play.category,
                             ]).map((d) => (
-                              <option key={d}>{d}</option>
+                              <option key={d} value={d}>
+                                {t(d)}
+                              </option>
                             ))}
                           </select>
                         </Field>
                       </div>
                       <div className="field-grid">
-                        <Field label="Pálya">
+                        <Field label={t("Pálya")}>
                           <select
                             value={editor.play.court}
                             onChange={(e) =>
@@ -1371,11 +1858,11 @@ export function App() {
                               })
                             }
                           >
-                            <option value="half">Félpálya</option>
-                            <option value="full">Egész pálya</option>
+                            <option value="half">{t("Félpálya")}</option>
+                            <option value="full">{t("Egész pálya")}</option>
                           </select>
                         </Field>
-                        <Field label="Felállás">
+                        <Field label={t("Felállás")}>
                           <input
                             value={editor.play.formation}
                             maxLength={40}
@@ -1387,7 +1874,7 @@ export function App() {
                           />
                         </Field>
                       </div>
-                      <Field label="Kezdő labdabirtokos">
+                      <Field label={t("Kezdő labdabirtokos")}>
                         <select
                           value={editor.play.ballOwnerId}
                           onChange={(e) =>
@@ -1398,7 +1885,7 @@ export function App() {
                         >
                           {editor.play.actors.map((a) => (
                             <option key={a.id} value={a.id}>
-                              {a.label} ({a.id})
+                              {t(a.label)} ({a.id})
                             </option>
                           ))}
                         </select>
@@ -1406,7 +1893,7 @@ export function App() {
                     </div>
                   </details>
                   <details open>
-                    <summary>Játékosok</summary>
+                    <summary>{t("Játékosok")}</summary>
                     <div className="inspector-fields">
                       <div className="roster">
                         {editor.play.actors.map((a) => (
@@ -1415,14 +1902,14 @@ export function App() {
                             key={a.id}
                             onClick={() => setSelectedActor(a.id)}
                           >
-                            {a.label}
+                            {t(a.label)}
                           </button>
                         ))}
                       </div>
                       <div className="field-grid">
-                        <Field label="Kijelölt jelölése">
+                        <Field label={t("Kijelölt jelölése")}>
                           <input
-                            aria-label="Játékos jelölése"
+                            aria-label={t("Játékos jelölése")}
                             value={
                               editor.play.actors.find(
                                 (a) => a.id === selectedActor,
@@ -1440,7 +1927,7 @@ export function App() {
                             }
                           />
                         </Field>
-                        <Field label="Új játékos">
+                        <Field label={t("Új játékos")}>
                           <select
                             disabled={editor.play.actors.length >= 30}
                             value=""
@@ -1464,10 +1951,10 @@ export function App() {
                               setSelectedActor(id);
                             }}
                           >
-                            <option value="">Hozzáadás…</option>
-                            <option value="attack">Támadó</option>
-                            <option value="defense">Védő</option>
-                            <option value="keeper">Kapus</option>
+                            <option value="">{t("Hozzáadás…")}</option>
+                            <option value="attack">{t("Támadó")}</option>
+                            <option value="defense">{t("Védő")}</option>
+                            <option value="keeper">{t("Kapus")}</option>
                           </select>
                         </Field>
                       </div>
@@ -1496,14 +1983,14 @@ export function App() {
                           setSelectedActor(next.id);
                         }}
                       >
-                        Kijelölt játékos eltávolítása
+                        {t("Kijelölt játékos eltávolítása")}
                       </button>
                     </div>
                   </details>
                   <details open>
-                    <summary>Aktuális fázis</summary>
+                    <summary>{t("Aktuális fázis")}</summary>
                     <div className="inspector-fields">
-                      <Field label="Fázis neve">
+                      <Field label={t("Fázis neve")}>
                         <input
                           value={phase.title}
                           maxLength={120}
@@ -1515,7 +2002,7 @@ export function App() {
                           }
                         />
                       </Field>
-                      <Field label="Időtartam (másodperc)">
+                      <Field label={t("Időtartam (másodperc)")}>
                         <input
                           type="number"
                           min=".5"
@@ -1531,7 +2018,7 @@ export function App() {
                           }
                         />
                       </Field>
-                      <Field label="Mit figyeljen a játékos?">
+                      <Field label={t("Mit figyeljen a játékos?")}>
                         <textarea
                           value={phase.note}
                           rows={2}
@@ -1545,7 +2032,8 @@ export function App() {
                         />
                       </Field>
                       <span className="eyebrow">
-                        MŰVELETEK · {phase.actions.length}
+                        {t("MŰVELETEK ·")}
+                        {phase.actions.length}
                       </span>
                       {phase.actions.map((a) => (
                         <div
@@ -1559,21 +2047,21 @@ export function App() {
                               setSelectedActor(a.actorId);
                             }}
                           >
-                            <span>{actionLabels[a.kind]}</span>
+                            <span>{t(actionLabels[a.kind])}</span>
                             <small>
-                              {
+                              {t(
                                 editor.play.actors.find(
                                   (ac) => ac.id === a.actorId,
-                                )?.label
-                              }
+                                )?.label ?? "",
+                              )}
                               {a.targetId
-                                ? ` → ${editor.play.actors.find((ac) => ac.id === a.targetId)?.label}`
+                                ? ` → ${t(editor.play.actors.find((ac) => ac.id === a.targetId)?.label ?? "")}`
                                 : ""}
                             </small>
                           </button>
                           <button
                             className="icon-button"
-                            aria-label={`${actionLabels[a.kind]} törlése`}
+                            aria-label={t`${t(actionLabels[a.kind])} törlése`}
                             onClick={() =>
                               edit((p) => {
                                 p.phases.find(
@@ -1588,7 +2076,7 @@ export function App() {
                           </button>
                           {selectedAction === a.id && (
                             <div className="action-timing">
-                              <Field label="Kezdés (s)">
+                              <Field label={t("Kezdés (s)")}>
                                 <input
                                   type="number"
                                   min="0"
@@ -1606,7 +2094,7 @@ export function App() {
                                   }
                                 />
                               </Field>
-                              <Field label="Hossz (s)">
+                              <Field label={t("Hossz (s)")}>
                                 <input
                                   type="number"
                                   min=".1"
@@ -1625,7 +2113,7 @@ export function App() {
                                   }
                                 />
                               </Field>
-                              <Field label="Útvonal (x,y; x,y)">
+                              <Field label={t("Útvonal (x,y; x,y)")}>
                                 <input
                                   defaultValue={a.path
                                     .map((pt) => `${pt.x},${pt.y}`)
@@ -1678,19 +2166,20 @@ export function App() {
                       ))}
                       {!phase.actions.length && (
                         <p className="muted small-text">
-                          A fenti eszközökkel adj mozgást vagy passzt a
-                          pályához.
+                          {t(
+                            "A fenti eszközökkel adj mozgást vagy passzt a pályához.",
+                          )}
                         </p>
                       )}
                       {!!phase.next.length && (
                         <>
-                          <span className="eyebrow">FOLYTATÁSOK</span>
+                          <span className="eyebrow">{t("FOLYTATÁSOK")}</span>
                           {phase.next.map((n, i) => (
                             <Field
                               label={
                                 editor.play.phases.find(
                                   (ph) => ph.id === n.phaseId,
-                                )?.title ?? "Folytatás"
+                                )?.title ?? t("Folytatás")
                               }
                               key={n.phaseId}
                             >
@@ -1730,15 +2219,15 @@ export function App() {
                               setIndex(0);
                             }}
                           >
-                            Fázis eltávolítása
+                            {t("Fázis eltávolítása")}
                           </button>
                         )}
                     </div>
                   </details>
                   <details>
-                    <summary>Edzői szempontok</summary>
+                    <summary>{t("Edzői szempontok")}</summary>
                     <div className="inspector-fields">
-                      <Field label="Soronként egy szempont">
+                      <Field label={t("Soronként egy szempont")}>
                         <textarea
                           rows={4}
                           value={editor.play.coachingPoints.join("\n")}
@@ -1753,9 +2242,9 @@ export function App() {
                   </details>
                   {!!problems.length && (
                     <div className="validation-box" role="status">
-                      <strong>Mentés előtt javítsd:</strong>
+                      <strong>{t("Mentés előtt javítsd:")}</strong>
                       {unique(problems).map((e, i) => (
-                        <p key={i}>{e}</p>
+                        <p key={i}>{t(e)}</p>
                       ))}
                     </div>
                   )}
@@ -1766,7 +2255,7 @@ export function App() {
                     }
                   >
                     <Download size={16} />
-                    Piszkozat exportálása
+                    {t("Piszkozat exportálása")}
                   </button>
                   <button
                     className="text-button danger-text"
@@ -1778,14 +2267,20 @@ export function App() {
                           setEditor(null);
                           setView("own");
                           void repo!
-                            .saveDraft(null)
-                            .then(() => setDraft(null))
+                            .saveDraft(
+                              null,
+                              editor.shared ? audience : undefined,
+                            )
+                            .then(() => {
+                              setDraft(null);
+                              setDraftOwner(undefined);
+                            })
                             .catch((e) => notice(errorText(e), true));
                         },
                       })
                     }
                   >
-                    Piszkozat elvetése
+                    {t("Piszkozat elvetése")}
                   </button>
                 </aside>
               </div>
@@ -1795,30 +2290,36 @@ export function App() {
             <>
               <section className="page-intro">
                 <div>
-                  <span className="eyebrow">MINDIG KÉZNÉL</span>
-                  <h1>A te műhelyed.</h1>
+                  <span className="eyebrow">{t("MINDIG KÉZNÉL")}</span>
+                  <h1>{t("A te műhelyed.")}</h1>
                   <p>
-                    Telepítés, biztonsági mentés és a taktikatár frissítése.
+                    {t(
+                      "Telepítés, biztonsági mentés és a taktikatár frissítése.",
+                    )}
                   </p>
                 </div>
               </section>
               <div className="settings-grid">
                 <section className="settings-card">
                   <Download size={25} />
-                  <h2>Telepítsd az alkalmazást</h2>
-                  <p>A kezdőképernyőről gyorsan elérheted, edzésen is.</p>
+                  <h2>{t("Telepítsd az alkalmazást")}</h2>
+                  <p>
+                    {t("A kezdőképernyőről gyorsan elérheted, edzésen is.")}
+                  </p>
                   <ol>
                     <li>
-                      <strong>iPhone és iPad:</strong> Safari → Megosztás →
-                      Hozzáadás a főképernyőhöz.
+                      <strong>{t("iPhone és iPad:")}</strong>
+                      {t("Safari → Megosztás → Hozzáadás a főképernyőhöz.")}
                     </li>
                     <li>
-                      <strong>Android:</strong> Chrome → Menü → Alkalmazás
-                      telepítése / Hozzáadás a kezdőképernyőhöz.
+                      <strong>{t("Android:")}</strong>
+                      {t(
+                        "Chrome → Menü → Alkalmazás telepítése / Hozzáadás a kezdőképernyőhöz.",
+                      )}
                     </li>
                     <li>
-                      <strong>Asztali gép:</strong> a böngésző címsorában
-                      válaszd a telepítést.
+                      <strong>{t("Asztali gép:")}</strong>
+                      {t("a böngésző címsorában válaszd a telepítést.")}
                     </li>
                   </ol>
                   <button
@@ -1826,28 +2327,31 @@ export function App() {
                     onClick={() => void installApp()}
                   >
                     <Download size={17} />
-                    Telepítés
+                    {t("Telepítés")}
                   </button>
                   <div className="settings-status">
                     <span
                       className={`status-dot ${offlineReady ? "ready" : ""}`}
                     />
                     {offlineReady
-                      ? "A jelenlegi verzió offline is elérhető."
-                      : "Az offline használat az első online betöltés után készül elő."}
+                      ? t("A jelenlegi verzió offline is elérhető.")
+                      : t(
+                          "Az offline használat az első online betöltés után készül elő.",
+                        )}
                   </div>
                 </section>
                 <section className="settings-card">
                   <Shield size={25} />
-                  <h2>Helyi mentés</h2>
+                  <h2>{t("Helyi mentés")}</h2>
                   <p>
-                    A saját taktikák ezen az eszközön maradnak. A böngésző
-                    adatainak törlése a helyi mentéseket is törölheti, ezért
-                    időnként exportáld őket.
+                    {t(
+                      "A saját taktikák ezen az eszközön maradnak. A böngésző adatainak törlése a helyi mentéseket is törölheti, ezért időnként exportáld őket.",
+                    )}
                   </p>
                   <div className="settings-status">
-                    {library.plays.length} saját taktika ·{" "}
-                    {library.favorites.length} kedvenc
+                    {library.plays.length}
+                    {t("saját taktika ·")} {library.favorites.length}
+                    {t("kedvenc")}
                   </div>
                   <button
                     className="button"
@@ -1860,7 +2364,7 @@ export function App() {
                     disabled={!library.plays.length}
                   >
                     <Download size={17} />
-                    Összes saját taktika exportálása
+                    {t("Összes saját taktika exportálása")}
                   </button>
                   <button
                     className="button"
@@ -1868,7 +2372,7 @@ export function App() {
                     onClick={() => uploadRef.current?.click()}
                   >
                     <Upload size={17} />
-                    Taktikák importálása
+                    {t("Taktikák importálása")}
                   </button>
                   <button
                     className="text-button"
@@ -1885,48 +2389,62 @@ export function App() {
                         .catch((e) => notice(errorText(e), true))
                     }
                   >
-                    Tartós helyi tárolás kérése
+                    {t("Tartós helyi tárolás kérése")}
                   </button>
                 </section>
                 <section className="settings-card">
                   <Wifi size={25} />
-                  <h2>Központi taktikatár</h2>
+                  <h2>{t("Központi taktikatár")}</h2>
                   <p>
-                    Opcionális HTTP-frissítés. A saját változatok megmaradnak, a
-                    letöltött katalógus offline is elérhető.
+                    {account.services
+                      ? t(
+                          "A Firebase taktikatár induláskor és visszacsatlakozáskor frissül. Másik katalógushoz adj meg HTTPS-címet.",
+                        )
+                      : t("Opcionális HTTP-frissítés.")}{" "}
+                    {t(
+                      "A saját változatok megmaradnak, a letöltött katalógus offline is elérhető.",
+                    )}
                   </p>
-                  <Field label="Katalógus HTTPS-címe">
+                  <Field label={t("Másik katalógus HTTPS-címe (opcionális)")}>
                     <input
                       type="url"
-                      placeholder="https://…/catalog/catalog.json"
+                      placeholder={t("https://…/catalog/catalog.json")}
                       value={catalogUrl}
                       onChange={(e) => setCatalogUrl(e.target.value)}
                     />
                   </Field>
                   <p className="small-text muted">
-                    Tartalomverzió: {activeCatalog.contentVersion} ·{" "}
+                    {t("Tartalomverzió:")}
+                    {activeCatalog.contentVersion} ·{" "}
                     {activeCatalog === catalog
-                      ? "Letöltött katalógus"
-                      : "Beépített mintatár"}
+                      ? t("Letöltött katalógus")
+                      : t("Beépített mintatár")}
                   </p>
                   <button
                     className="button primary"
-                    disabled={!catalogUrl.trim() || updating || busy || !online}
+                    disabled={
+                      (!catalogUrl.trim() && !account.services) ||
+                      updating ||
+                      busy ||
+                      publishing ||
+                      !online
+                    }
                     onClick={() => void updateCatalog()}
                   >
                     <Download size={17} />
                     {updating
-                      ? "Ellenőrzés és frissítés…"
-                      : "Taktikatár frissítése"}
+                      ? t("Ellenőrzés és frissítés…")
+                      : t("Taktikatár frissítése")}
                   </button>
+                  {cloudStatus && <p role="status">{t(cloudStatus)}</p>}
                 </section>
               </div>
             </>
           )}
         </main>
         <footer className="footer">
-          <span>Gondolkodj játékban.</span>
-          <span>HANDBALL TACTICS</span>
+          <span>{t("Gondolkodj játékban.")}</span>
+          <span>{t("HANDBALL PLAYLAB")}</span>
         </footer>
       </div>
       {message && (
@@ -1934,10 +2452,10 @@ export function App() {
           className={`toast ${message.error ? "error" : ""}`}
           role={message.error ? "alert" : "status"}
         >
-          <span>{message.text}</span>
+          <span>{t(message.text)}</span>
           <button
             className="icon-button"
-            aria-label="Értesítés bezárása"
+            aria-label={t("Értesítés bezárása")}
             onClick={() => setMessage(null)}
           >
             <X size={17} />
@@ -1969,15 +2487,15 @@ export function App() {
               }
             }}
           >
-            <h2 id="confirmation-title">{confirm.title}</h2>
-            <p>{confirm.body}</p>
+            <h2 id="confirmation-title">{t(confirm.title)}</h2>
+            <p>{t(confirm.body)}</p>
             <div>
               <button
                 className="button"
                 autoFocus
                 onClick={() => setConfirm(null)}
               >
-                Mégse
+                {t("Mégse")}
               </button>
               <button
                 className="button primary"
@@ -1986,7 +2504,7 @@ export function App() {
                   setConfirm(null);
                 }}
               >
-                Megerősítés
+                {t("Megerősítés")}
               </button>
             </div>
           </section>
@@ -2001,12 +2519,12 @@ export function App() {
         <div className="board-top">
           <span>
             <span className="board-indicator" />
-            {editing ? "SZERKESZTŐ" : "TAKTIKAI TÁBLA"}
+            {editing ? t("SZERKESZTŐ") : t("TAKTIKAI TÁBLA")}
           </span>
           <div>
             <button
               className={`icon-button ${showDefense ? "chosen" : ""}`}
-              aria-label="Védők megjelenítése"
+              aria-label={t("Védők megjelenítése")}
               aria-pressed={showDefense}
               onClick={() => setShowDefense(!showDefense)}
             >
@@ -2014,7 +2532,7 @@ export function App() {
             </button>
             <button
               className={`icon-button ${showPaths ? "chosen" : ""}`}
-              aria-label="Útvonalak megjelenítése"
+              aria-label={t("Útvonalak megjelenítése")}
               aria-pressed={showPaths}
               onClick={() => setShowPaths(!showPaths)}
             >
@@ -2022,7 +2540,7 @@ export function App() {
             </button>
             <button
               className="icon-button"
-              aria-label={focusCourt ? "Normál nézet" : "Pálya nagyítása"}
+              aria-label={focusCourt ? t("Normál nézet") : t("Pálya nagyítása")}
               onClick={() => setFocusCourt(!focusCourt)}
             >
               {focusCourt ? <X size={18} /> : <Maximize2 size={17} />}
@@ -2062,15 +2580,15 @@ export function App() {
           <div className="court-legend">
             <span>
               <i className="attack-dot" />
-              Támadó
+              {t("Támadó")}
             </span>
             <span>
               <i className="defense-dot" />
-              Védő
+              {t("Védő")}
             </span>
             <span>
               <i className="ball-dot" />
-              Labda
+              {t("Labda")}
             </span>
           </div>
         </div>
@@ -2078,22 +2596,23 @@ export function App() {
           <div className="phase-caption">
             <span>{String(index + 1).padStart(2, "0")}</span>
             <div>
-              <strong>{phase.title}</strong>
+              <strong>{playText(play, phase.title)}</strong>
               <small>
                 {playing
-                  ? "Lejátszás folyamatban"
+                  ? t("Lejátszás folyamatban")
                   : time >= phase.duration
-                    ? "Fázis vége"
-                    : "Mozgássor és időzítés"}
+                    ? t("Fázis vége")
+                    : t("Mozgássor és időzítés")}
               </small>
             </div>
             <span className="time-label">
-              {time.toFixed(1)} / {phase.duration.toFixed(1)} s
+              {time.toFixed(1)} / {phase.duration.toFixed(1)}
+              {t("s")}
             </span>
           </div>
           <input
             className="timeline"
-            aria-label="Lejátszás időpontja"
+            aria-label={t("Lejátszás időpontja")}
             type="range"
             min="0"
             max={phase.duration}
@@ -2108,7 +2627,7 @@ export function App() {
             <div>
               <button
                 className="icon-button"
-                aria-label="Lejátszás újrakezdése"
+                aria-label={t("Lejátszás újrakezdése")}
                 onClick={() => {
                   setPlaying(false);
                   setTime(0);
@@ -2120,7 +2639,7 @@ export function App() {
               </button>
               <button
                 className="icon-button"
-                aria-label="Előző fázis"
+                aria-label={t("Előző fázis")}
                 disabled={index === 0}
                 onClick={() => {
                   setIndex(index - 1);
@@ -2132,7 +2651,7 @@ export function App() {
               </button>
               <button
                 className="play-button"
-                aria-label={playing ? "Szünet" : "Lejátszás"}
+                aria-label={playing ? t("Szünet") : t("Lejátszás")}
                 onClick={() => {
                   if (time >= phase.duration) setTime(0);
                   setPlaying(!playing);
@@ -2146,7 +2665,7 @@ export function App() {
               </button>
               <button
                 className="icon-button"
-                aria-label="Következő fázis"
+                aria-label={t("Következő fázis")}
                 disabled={!route[index + 1] && phase.next.length !== 1}
                 onClick={() => advance()}
               >
@@ -2154,7 +2673,7 @@ export function App() {
               </button>
             </div>
             <select
-              aria-label="Lejátszási sebesség"
+              aria-label={t("Lejátszási sebesség")}
               value={speed}
               onChange={(e) => {
                 setPlaying(false);
@@ -2170,7 +2689,7 @@ export function App() {
         </div>
         {!!phase.next.length && phase.next.length > 1 && (
           <div className="decisions">
-            <span className="eyebrow">HOGYAN REAGÁL A VÉDELEM?</span>
+            <span className="eyebrow">{t("HOGYAN REAGÁL A VÉDELEM?")}</span>
             <div>
               {phase.next.map((n) => (
                 <button
@@ -2178,7 +2697,7 @@ export function App() {
                   key={n.phaseId}
                   onClick={() => advance(n.phaseId)}
                 >
-                  {n.label}
+                  {playText(play, n.label)}
                   <ArrowRight size={14} />
                 </button>
               ))}
@@ -2188,7 +2707,7 @@ export function App() {
         {phase.note && (
           <div className="phase-note">
             <CircleHelp size={16} />
-            <p>{phase.note}</p>
+            <p>{playText(play, phase.note)}</p>
           </div>
         )}
       </div>

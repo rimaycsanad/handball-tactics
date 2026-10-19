@@ -1,3 +1,4 @@
+import {translationKey} from "../domain/translation-key";
 import { describe, expect, it } from "vitest";
 import { builtInPlays, builtInCatalogVersion } from "./seeds";
 import { selectCatalog } from "./catalog-selection";
@@ -80,18 +81,41 @@ describe("bővített taktikai katalógus", () => {
       );
     }
   });
-  it("az új beépített változat felváltja a régi 12 tételes cache-t, az újabb HTTP-katalógust megőrzi", () => {
-    const old: Catalog = {
+  it("a régi és másik fiókhoz tartozó cache nem jelenhet meg vendégként", () => {
+    const cached: Catalog = {
       schemaVersion: 1,
-      contentVersion: 1,
-      plays: builtInPlays.slice(0, 12),
+      contentVersion: builtInCatalogVersion,
+      plays: builtInPlays,
+      audience: "alice",
     };
-    expect(selectCatalog(old).contentVersion).toBe(builtInCatalogVersion);
-    expect(selectCatalog(old).plays.length).toBeGreaterThanOrEqual(60);
-    const newer: Catalog = {
-      ...old,
-      contentVersion: builtInCatalogVersion + 1,
-    };
-    expect(selectCatalog(newer)).toBe(newer);
+    expect(selectCatalog(cached).plays).toEqual([]);
+    expect(selectCatalog(cached, "bob").plays).toEqual([]);
+    expect(selectCatalog(cached, "alice")).toBe(cached);
+    expect(
+      selectCatalog({ ...cached, audience: undefined }, "alice").plays,
+    ).toEqual([]);
+    const publicCache = { ...cached, audience: "public" };
+    expect(selectCatalog(publicCache).plays).toHaveLength(5);
+    expect(selectCatalog(publicCache).plays.every((p) => !p.requiresAuth)).toBe(
+      true,
+    );
+  });
+  it("minden katalógustaktika minden szövegéhez tartozik angol fordítás", () => {
+    expect(builtInPlays.filter((p) => !p.requiresAuth)).toHaveLength(5);
+    for (const p of builtInPlays) {
+      const texts = [
+        p.title,
+        p.description,
+        p.category,
+        ...p.coachingPoints,
+        ...p.phases.flatMap((ph) => [
+          ph.title,
+          ph.note,
+          ...ph.next.map((n) => n.label),
+        ]),
+      ];
+      for (const text of texts.filter(Boolean))
+        expect(p.english?.[translationKey(text)], text).toBeTruthy();
+    }
   });
 });
